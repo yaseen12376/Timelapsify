@@ -4,6 +4,8 @@ from datetime import datetime
 from io import BytesIO
 import cv2
 import tempfile
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, render_template_string, jsonify, redirect, Response
 from dotenv import load_dotenv
 import pytz
@@ -487,33 +489,77 @@ def list_frame_keys(camera: str, from_date: str, to_date: str) -> list[str]:
 
 
 def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> bool:
+    """Efficient timelapse builder.
+    Optimizations:
+    - Direct S3 object download instead of VideoCapture on presigned URL.
+    - Parallel downloads using ThreadPoolExecutor.
+    - Frame sampling to cap FPS (<=30) & total frames for requested duration.
+    """
     if not frame_keys:
         return False
-    # Read frames one by one via presigned URL and assemble video
-    # Compute fps: frames / duration
-    fps = max(1, int(round(len(frame_keys) / max(1, duration_sec))))
 
-    first_img = None
-    frames = []
-    for key in frame_keys:
-        url = presigned_url(key, expires_in=600)
-        cap = cv2.VideoCapture(url)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok or frame is None:
-            continue
-        if first_img is None:
-            first_img = frame
-        frames.append(frame)
+    # Configurable workers - increased default for faster downloads
+    max_workers = int(os.getenv("TIMELAPSE_MAX_WORKERS", "16"))
 
-    if not frames:
+    total = len(frame_keys)
+    # Target fps capped at 30; if many frames, sample evenly
+    target_fps = min(30, max(1, int(round(total / max(1, duration_sec)))))
+    # Limit frames so fps matches duration (avoid excessive unused frames)
+    target_frame_count = min(total, target_fps * duration_sec)
+    if target_frame_count < total:
+        # Even sampling of indices
+        indices = np.linspace(0, total - 1, target_frame_count, dtype=int)
+        frame_keys = [frame_keys[i] for i in indices]
+        total = len(frame_keys)
+        # Recompute fps after sampling
+        target_fps = max(1, min(30, int(round(total / max(1, duration_sec)))))
+
+    def fetch_and_decode(idx_key_tuple):
+        """Optimized fetch with index for ordering"""
+        idx, key = idx_key_tuple
+        try:
+            obj = client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
+            data = obj['Body'].read()
+            # Faster decode with reduced quality checks
+            arr = np.frombuffer(data, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            return idx, frame
+        except:
+            return idx, None
+
+    # Parallel fetch with batch processing
+    frames_dict = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all at once for better batching
+        futures = [executor.submit(fetch_and_decode, (i, k)) for i, k in enumerate(frame_keys)]
+        for future in as_completed(futures):
+            idx, frame = future.result()
+            if frame is not None:
+                frames_dict[idx] = frame
+
+    if not frames_dict:
         return False
 
+    # Preserve order and write directly without intermediate list
+    ordered_indices = sorted(frames_dict.keys())
+    if not ordered_indices:
+        return False
+
+    first_img = frames_dict[ordered_indices[0]]
     h, w = first_img.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-    for f in frames:
-        out.write(f)
+    
+    # Use H264 codec if available (faster encoding), fallback to mp4v
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"H264")
+    except:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    
+    out = cv2.VideoWriter(output_path, fourcc, target_fps, (w, h))
+    
+    # Write frames in order
+    for idx in ordered_indices:
+        out.write(frames_dict[idx])
+    
     out.release()
     return True
 
