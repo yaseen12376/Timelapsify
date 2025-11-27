@@ -1,4 +1,24 @@
 import os
+import sys
+import types
+
+# Work around broken pyOpenSSL/cryptography on some servers by preventing
+# botocore -> urllib3 from importing and injecting pyOpenSSL. Standard library
+# ssl provides SNI and is sufficient for AWS endpoints.
+try:
+    if "urllib3.contrib.pyopenssl" not in sys.modules:
+        _pyopenssl_stub = types.ModuleType("urllib3.contrib.pyopenssl")
+
+        def _noop():
+            return None
+
+        _pyopenssl_stub.inject_into_urllib3 = _noop
+        _pyopenssl_stub.extract_from_urllib3 = _noop
+        sys.modules["urllib3.contrib.pyopenssl"] = _pyopenssl_stub
+except Exception:
+    # Best-effort: if anything goes wrong, fall back to default behavior.
+    pass
+
 import boto3
 from botocore.client import Config
 from urllib.parse import urljoin
