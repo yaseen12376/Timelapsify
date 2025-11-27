@@ -4,7 +4,7 @@ from datetime import datetime
 from io import BytesIO
 import cv2
 import tempfile
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, render_template_string, jsonify, redirect, Response
 from dotenv import load_dotenv
 import pytz
 
@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 load_dotenv()
 
-from src.s3_utils import list_objects, upload_file, presigned_url, generate_s3_http_url
+from src.s3_utils import list_objects, upload_file, presigned_url, generate_s3_http_url, client
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
@@ -196,6 +196,24 @@ TEMPLATE = """
         .copy-btn:hover {
             background: #5568d3;
         }
+        .download-btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            margin-top: 15px;
+            transition: all 0.2s;
+        }
+        .download-btn:hover {
+            background: #218838;
+            transform: translateY(-2px);
+        }
         .error {
             color: #dc3545;
             background: #ffe6e6;
@@ -311,12 +329,17 @@ TEMPLATE = """
         
         <div class="result" id="result">
             <h3>✅ Timelapse Generated Successfully!</h3>
+            
+            <a id="downloadBtn" href="#" class="download-btn" download style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
+            
             <div class="url-label">S3 URI</div>
             <div class="url-box" id="s3Uri"></div>
             <div class="url-label">Download URL</div>
             <div class="url-box" id="httpUrl"></div>
-            <button class="copy-btn" onclick="copyUrl('s3')">Copy S3 URI</button>
-            <button class="copy-btn" onclick="copyUrl('http')">Copy URL</button>
+            <div style="margin-top: 10px;">
+                <button class="copy-btn" onclick="copyUrl('s3')">Copy S3 URI</button>
+                <button class="copy-btn" onclick="copyUrl('http')">Copy URL</button>
+            </div>
         </div>
         
         <div class="error" id="error"></div>
@@ -405,6 +428,12 @@ TEMPLATE = """
                 if (response.ok) {
                     document.getElementById('s3Uri').textContent = data.s3_uri;
                     document.getElementById('httpUrl').textContent = data.url;
+                    
+                    // Set up download button with presigned URL
+                    const downloadBtn = document.getElementById('downloadBtn');
+                    downloadBtn.href = data.download_url;
+                    downloadBtn.download = data.filename;
+                    
                     document.getElementById('result').classList.add('show');
                 } else {
                     document.getElementById('error').textContent = data.error || 'An error occurred';
@@ -520,7 +549,25 @@ def generate():
         s3_key = f"{OUTPUT_PREFIX}/{out_name}"
         s3_uri = upload_file(local_out, s3_key, content_type="video/mp4")
         url = generate_s3_http_url(s3_key)
-        return jsonify({"s3_uri": s3_uri, "url": url})
+        
+        # Generate presigned URL with content-disposition for forced download
+        download_url = client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': S3_BUCKET_NAME,
+                'Key': s3_key,
+                'ResponseContentDisposition': f'attachment; filename="{out_name}"',
+                'ResponseContentType': 'video/mp4'
+            },
+            ExpiresIn=3600
+        )
+        
+        return jsonify({
+            "s3_uri": s3_uri, 
+            "url": url, 
+            "download_url": download_url,
+            "filename": out_name
+        })
 
 
 if __name__ == "__main__":
