@@ -338,7 +338,7 @@ TEMPLATE = """
         <div class="result" id="result">
             <h3>✅ Timelapse Generated Successfully!</h3>
             
-            <a id="downloadBtn" href="#" class="download-btn" download style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
+            <a id="playBtn" href="#" class="download-btn" style="display:block; text-align:center; margin-bottom:20px;">▶️ Play Video in Browser</a>
             
             <div class="url-label">S3 URI</div>
             <div class="url-box" id="s3Uri"></div>
@@ -440,9 +440,8 @@ TEMPLATE = """
                     document.getElementById('httpUrl').textContent = data.url;
                     
                     // Set up download button with presigned URL
-                    const downloadBtn = document.getElementById('downloadBtn');
-                    downloadBtn.href = data.download_url;
-                    downloadBtn.download = data.filename;
+                    const playBtn = document.getElementById('playBtn');
+                    playBtn.href = data.play_url;
                     
                     document.getElementById('result').classList.add('show');
                 } else {
@@ -560,7 +559,7 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     - Frame sampling to cap FPS (<=30) & total frames for requested duration.
     """
     if not frame_keys:
-        return False
+        return (False, None, None)
 
     # Configurable workers - increased default for faster downloads
     max_workers = int(os.getenv("TIMELAPSE_MAX_WORKERS", "16"))
@@ -610,12 +609,83 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     # Preserve order and write directly without intermediate list
     ordered_indices = sorted(frames_dict.keys())
     if not ordered_indices:
-        return False
+        return (False, None, None)
 
     first_img = frames_dict[ordered_indices[0]]
     h, w = first_img.shape[:2]
 
-    # Try multiple codecs/containers in order of preference
+    # Determine target resolution (optional upscaling)
+    target_w, target_h = w, h
+    try:
+        target_w_env = os.getenv("TIMELAPSE_TARGET_WIDTH")
+        target_h_env = os.getenv("TIMELAPSE_TARGET_HEIGHT")
+        min_w_env = os.getenv("TIMELAPSE_MIN_WIDTH")
+        min_h_env = os.getenv("TIMELAPSE_MIN_HEIGHT")
+
+        if target_w_env and target_h_env:
+            tw = int(target_w_env)
+            th = int(target_h_env)
+            if tw > 0 and th > 0:
+                target_w, target_h = tw, th
+        else:
+            scale = 1.0
+            if min_w_env:
+                mw = int(min_w_env)
+                if mw > 0:
+                    scale = max(scale, mw / w)
+            if min_h_env:
+                mh = int(min_h_env)
+                if mh > 0:
+                    scale = max(scale, mh / h)
+            if scale > 1.0:
+                target_w = int(round(w * scale))
+                target_h = int(round(h * scale))
+        # Ensure even dimensions for H.264 compatibility
+        if target_w % 2 != 0:
+            target_w += 1
+        if target_h % 2 != 0:
+            target_h += 1
+    except Exception as e:
+        logging.warning(f"Resolution selection error, using source size {w}x{h}: {e}")
+        target_w, target_h = w, h
+
+    # Preferred: high-quality H.264 via imageio-ffmpeg if available
+    base, _ext = os.path.splitext(output_path)
+    try:
+        import imageio
+        crf = os.getenv("TIMELAPSE_CRF", "18")  # lower = higher quality; typical 18–24
+        preset = os.getenv("TIMELAPSE_PRESET", "veryfast")
+        mp4_path = base + ".mp4"
+        logging.info(f"Attempting FFmpeg H.264 encode with CRF={crf}, preset={preset}")
+        writer = imageio.get_writer(
+            mp4_path,
+            format="ffmpeg",
+            fps=target_fps,
+            codec="libx264",
+            ffmpeg_params=[
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-crf", str(crf),
+                "-preset", preset,
+                # Helpful defaults; adjust if needed
+                "-profile:v", "high", "-level", "4.2"
+            ],
+        )
+        for idx in ordered_indices:
+            # Convert BGR (OpenCV) to RGB for imageio/ffmpeg
+            frame = frames_dict[idx]
+            if frame.shape[1] != target_w or frame.shape[0] != target_h:
+                interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
+                frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            writer.append_data(frame_rgb)
+        writer.close()
+        logging.info(f"Encoded with FFmpeg H.264 -> {mp4_path} at {target_w}x{target_h}")
+        return (True, mp4_path, "video/mp4")
+    except Exception as e:
+        logging.warning(f"FFmpeg H.264 path not available, falling back to OpenCV encoders: {e}")
+
+    # Fallback: Try multiple OpenCV codecs/containers in order of preference
     # Each tuple: (fourcc_str, extension, mime)
     codec_options = [
         ("avc1", ".mp4", "video/mp4"),
@@ -625,7 +695,6 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
         ("MJPG", ".avi", "video/x-msvideo"),
     ]
 
-    base, _ext = os.path.splitext(output_path)
     writer = None
     actual_path = None
     actual_mime = None
@@ -633,7 +702,7 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     for fourcc_str, ext, mime in codec_options:
         candidate_path = base + ext
         fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (w, h))
+        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (target_w, target_h))
         if out.isOpened():
             logging.info(f"Using codec {fourcc_str} -> {candidate_path}")
             writer = out
@@ -650,9 +719,13 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
         return (False, None, None)
 
     # Write frames in order
-    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps})")
+    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps}, size: {target_w}x{target_h})")
     for i, idx in enumerate(ordered_indices):
-        writer.write(frames_dict[idx])
+        frame = frames_dict[idx]
+        if frame.shape[1] != target_w or frame.shape[0] != target_h:
+            interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
+        writer.write(frame)
         if i < 3 or i >= len(ordered_indices) - 3:
             # Log first and last 3 frames with their keys
             key = frame_keys[idx]
@@ -706,13 +779,12 @@ def generate():
         s3_uri = upload_file(actual_path, s3_key, content_type=mime)
         url = generate_s3_http_url(s3_key)
         
-        # Generate presigned URL with content-disposition for forced download
-        download_url = client.generate_presigned_url(
+        # Generate presigned URL suitable for inline playback (no attachment disposition)
+        play_url = client.generate_presigned_url(
             'get_object',
             Params={
                 'Bucket': S3_BUCKET_NAME,
                 'Key': s3_key,
-                'ResponseContentDisposition': f'attachment; filename="{file_name}"',
                 'ResponseContentType': mime
             },
             ExpiresIn=3600
@@ -721,7 +793,7 @@ def generate():
         return jsonify({
             "s3_uri": s3_uri, 
             "url": url, 
-            "download_url": download_url,
+            "play_url": play_url,
             "filename": file_name
         })
 
