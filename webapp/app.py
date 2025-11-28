@@ -8,6 +8,7 @@ import tempfile
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, render_template_string, jsonify, redirect, Response
+from flask_cors import CORS
 from dotenv import load_dotenv
 import pytz
 
@@ -27,6 +28,7 @@ TZ = pytz.timezone("Asia/Kolkata")
 CAMERAS = ["camera1", "camera2", "camera3"]
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 logging.basicConfig(level=logging.INFO)
 
 TEMPLATE = """
