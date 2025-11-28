@@ -22,7 +22,7 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 INPUT_PREFIX = "Timelapse input"
 OUTPUT_PREFIX = "Timelapse output"
-TZ = pytz.timezone("Asia/Singapore")
+TZ = pytz.timezone("Asia/Kolkata")
 
 CAMERAS = ["camera1", "camera2", "camera3"]
 
@@ -504,6 +504,26 @@ def list_frame_keys(camera: str, from_datetime: str, to_datetime: str) -> list[s
     
     # Filter by time if specified
     if 'T' in from_datetime:
+        logging.info(f"Time filtering with India TZ input: {start} to {end}")
+        logging.info(f"Total frames before filtering: {len(all_keys)}")
+        
+        # User inputs time in India timezone (Asia/Kolkata UTC+5:30)
+        # S3 frames were captured with Singapore timezone (Asia/Singapore UTC+8)
+        # We need to convert India time to Singapore time to match filenames
+        
+        india_tz = pytz.timezone("Asia/Kolkata")
+        singapore_tz = pytz.timezone("Asia/Singapore")
+        
+        # Make user input timezone-aware (India)
+        start_india = india_tz.localize(start)
+        end_india = india_tz.localize(end)
+        
+        # Convert to Singapore timezone (what's in S3 filenames)
+        start_singapore = start_india.astimezone(singapore_tz)
+        end_singapore = end_india.astimezone(singapore_tz)
+        
+        logging.info(f"Converted to Singapore TZ (S3 filenames): {start_singapore.strftime('%Y-%m-%d %H:%M:%S')} to {end_singapore.strftime('%Y-%m-%d %H:%M:%S')}")
+        
         filtered_keys = []
         for key in all_keys:
             # Extract timestamp from key: camera1_20251126_153000.jpg
@@ -512,11 +532,19 @@ def list_frame_keys(camera: str, from_datetime: str, to_datetime: str) -> list[s
                 if len(parts) >= 3:
                     date_str = parts[1]
                     time_str = parts[2].split('.')[0]
-                    frame_dt = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
-                    if start <= frame_dt <= end:
+                    # Parse as naive datetime
+                    frame_dt_naive = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+                    
+                    # S3 filenames are in Singapore timezone
+                    frame_dt_singapore = singapore_tz.localize(frame_dt_naive)
+                    
+                    # Compare in Singapore timezone
+                    if start_singapore <= frame_dt_singapore <= end_singapore:
                         filtered_keys.append(key)
-            except:
+            except Exception as e:
+                logging.warning(f"Failed to parse key {key}: {e}")
                 continue
+        logging.info(f"Frames after time filtering: {len(filtered_keys)}")
         return sorted(filtered_keys)
     
     return sorted(all_keys)
@@ -557,8 +585,11 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
             # Faster decode with reduced quality checks
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if idx < 3:
+                logging.info(f"Downloaded frame {idx}: {key}")
             return idx, frame
-        except:
+        except Exception as e:
+            logging.error(f"Failed to fetch frame {idx} ({key}): {e}")
             return idx, None
 
     # Parallel fetch with batch processing
@@ -617,8 +648,13 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
         return (False, None, None)
 
     # Write frames in order
-    for idx in ordered_indices:
+    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps})")
+    for i, idx in enumerate(ordered_indices):
         writer.write(frames_dict[idx])
+        if i < 3 or i >= len(ordered_indices) - 3:
+            # Log first and last 3 frames with their keys
+            key = frame_keys[idx]
+            logging.info(f"Frame {i}: index={idx}, key={key.split('/')[-1]}")
 
     writer.release()
     return (True, actual_path, actual_mime)
@@ -637,22 +673,26 @@ def generate():
     to_date = request.form.get("to_date")
     duration = int(request.form.get("duration", "10"))
     camera = request.form.get("camera")
+    
+    logging.info(f"Generate request: camera={camera}, from={from_date}, to={to_date}, duration={duration}")
+    
     if camera not in CAMERAS:
         return jsonify({"error": "Invalid camera"}), 400
 
     keys = list_frame_keys(camera, from_date, to_date)
+    logging.info(f"Found {len(keys)} frames")
+    if len(keys) > 0:
+        logging.info(f"First frame: {keys[0]}")
+        logging.info(f"Last frame: {keys[-1]}")
+    
     if not keys:
         return jsonify({"error": "No frames found in range"}), 404
 
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-<<<<<<< HEAD
     # Clean datetime strings for filename
     from_clean = from_date.replace('T', '_').replace(':', '')
     to_clean = to_date.replace('T', '_').replace(':', '')
-    out_name = f"{camera}_timelapse_{from_clean}_to_{to_clean}_{ts}.mp4"
-=======
-    base_name = f"{camera}_timelapse_{from_date}_to_{to_date}_{ts}"
->>>>>>> f2f0db2a2ceca5c8719de9f85f091936708ee920
+    base_name = f"{camera}_timelapse_{from_clean}_to_{to_clean}_{ts}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_out = os.path.join(tmpdir, base_name)
