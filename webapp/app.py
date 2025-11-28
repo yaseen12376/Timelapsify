@@ -2,6 +2,7 @@ import os
 import sys
 from datetime import datetime
 from io import BytesIO
+import logging
 import cv2
 import tempfile
 import numpy as np
@@ -26,6 +27,7 @@ TZ = pytz.timezone("Asia/Singapore")
 CAMERAS = ["camera1", "camera2", "camera3"]
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
 TEMPLATE = """
 <!doctype html>
@@ -520,7 +522,7 @@ def list_frame_keys(camera: str, from_datetime: str, to_datetime: str) -> list[s
     return sorted(all_keys)
 
 
-def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> bool:
+def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> tuple[bool, str | None, str | None]:
     """Efficient timelapse builder.
     Optimizations:
     - Direct S3 object download instead of VideoCapture on presigned URL.
@@ -570,7 +572,7 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
                 frames_dict[idx] = frame
 
     if not frames_dict:
-        return False
+        return (False, None, None)
 
     # Preserve order and write directly without intermediate list
     ordered_indices = sorted(frames_dict.keys())
@@ -579,21 +581,47 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
 
     first_img = frames_dict[ordered_indices[0]]
     h, w = first_img.shape[:2]
-    
-    # Use H264 codec if available (faster encoding), fallback to mp4v
-    try:
-        fourcc = cv2.VideoWriter_fourcc(*"H264")
-    except:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    
-    out = cv2.VideoWriter(output_path, fourcc, target_fps, (w, h))
-    
+
+    # Try multiple codecs/containers in order of preference
+    # Each tuple: (fourcc_str, extension, mime)
+    codec_options = [
+        ("avc1", ".mp4", "video/mp4"),
+        ("H264", ".mp4", "video/mp4"),
+        ("mp4v", ".mp4", "video/mp4"),
+        ("XVID", ".avi", "video/x-msvideo"),
+        ("MJPG", ".avi", "video/x-msvideo"),
+    ]
+
+    base, _ext = os.path.splitext(output_path)
+    writer = None
+    actual_path = None
+    actual_mime = None
+
+    for fourcc_str, ext, mime in codec_options:
+        candidate_path = base + ext
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (w, h))
+        if out.isOpened():
+            logging.info(f"Using codec {fourcc_str} -> {candidate_path}")
+            writer = out
+            actual_path = candidate_path
+            actual_mime = mime
+            break
+        else:
+            # Ensure it's released if not opened
+            out.release()
+            logging.warning(f"Failed to open VideoWriter with codec {fourcc_str} for {candidate_path}")
+
+    if writer is None:
+        logging.error("No available video encoder found. Timelapse build aborted.")
+        return (False, None, None)
+
     # Write frames in order
     for idx in ordered_indices:
-        out.write(frames_dict[idx])
-    
-    out.release()
-    return True
+        writer.write(frames_dict[idx])
+
+    writer.release()
+    return (True, actual_path, actual_mime)
 
 
 @app.route("/", methods=["GET"])
@@ -617,18 +645,23 @@ def generate():
         return jsonify({"error": "No frames found in range"}), 404
 
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+<<<<<<< HEAD
     # Clean datetime strings for filename
     from_clean = from_date.replace('T', '_').replace(':', '')
     to_clean = to_date.replace('T', '_').replace(':', '')
     out_name = f"{camera}_timelapse_{from_clean}_to_{to_clean}_{ts}.mp4"
+=======
+    base_name = f"{camera}_timelapse_{from_date}_to_{to_date}_{ts}"
+>>>>>>> f2f0db2a2ceca5c8719de9f85f091936708ee920
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_out = os.path.join(tmpdir, out_name)
-        ok = build_timelapse_from_keys(keys, local_out, duration)
-        if not ok:
-            return jsonify({"error": "Failed to build timelapse"}), 500
-        s3_key = f"{OUTPUT_PREFIX}/{out_name}"
-        s3_uri = upload_file(local_out, s3_key, content_type="video/mp4")
+        local_out = os.path.join(tmpdir, base_name)
+        ok, actual_path, mime = build_timelapse_from_keys(keys, local_out, duration)
+        if not ok or not actual_path or not mime:
+            return jsonify({"error": "Failed to build timelapse (no encoder available)"}), 500
+        file_name = os.path.basename(actual_path)
+        s3_key = f"{OUTPUT_PREFIX}/{file_name}"
+        s3_uri = upload_file(actual_path, s3_key, content_type=mime)
         url = generate_s3_http_url(s3_key)
         
         # Generate presigned URL with content-disposition for forced download
@@ -637,8 +670,8 @@ def generate():
             Params={
                 'Bucket': S3_BUCKET_NAME,
                 'Key': s3_key,
-                'ResponseContentDisposition': f'attachment; filename="{out_name}"',
-                'ResponseContentType': 'video/mp4'
+                'ResponseContentDisposition': f'attachment; filename="{file_name}"',
+                'ResponseContentType': mime
             },
             ExpiresIn=3600
         )
@@ -647,7 +680,7 @@ def generate():
             "s3_uri": s3_uri, 
             "url": url, 
             "download_url": download_url,
-            "filename": out_name
+            "filename": file_name
         })
 
 
