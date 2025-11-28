@@ -80,6 +80,7 @@ TEMPLATE = """
             font-size: 14px;
         }
         input[type="date"],
+        input[type="datetime-local"],
         input[type="number"],
         select {
             width: 100%;
@@ -91,6 +92,7 @@ TEMPLATE = """
             background: #fafafa;
         }
         input[type="date"]:focus,
+        input[type="datetime-local"]:focus,
         input[type="number"]:focus,
         select:focus {
             outline: none;
@@ -295,13 +297,13 @@ TEMPLATE = """
             </div>
             
             <div class="form-group">
-                <label for="from_date">From Date</label>
-                <input type="date" id="from_date" name="from_date" required>
+                <label for="from_date">From Date & Time</label>
+                <input type="datetime-local" id="from_date" name="from_date" required>
             </div>
             
             <div class="form-group">
-                <label for="to_date">To Date</label>
-                <input type="date" id="to_date" name="to_date" required>
+                <label for="to_date">To Date & Time</label>
+                <input type="datetime-local" id="to_date" name="to_date" required>
             </div>
             
             <div class="form-group">
@@ -405,7 +407,9 @@ TEMPLATE = """
             const year = date.getFullYear();
             const month = String(date.getMonth() + 1).padStart(2, '0');
             const day = String(date.getDate()).padStart(2, '0');
-            return `${year}-${month}-${day}`;
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            return `${year}-${month}-${day}T${hours}:${minutes}`;
         }
         
         document.getElementById('timelapseForm').addEventListener('submit', async function(e) {
@@ -468,24 +472,52 @@ TEMPLATE = """
 """
 
 
-def list_frame_keys(camera: str, from_date: str, to_date: str) -> list[str]:
-    # List keys under each date folder between range
-    # Date format: YYYY-MM-DD stored in S3 paths
-    start = datetime.strptime(from_date, "%Y-%m-%d")
-    end = datetime.strptime(to_date, "%Y-%m-%d")
-    days = (end - start).days
-    if days < 0:
+def list_frame_keys(camera: str, from_datetime: str, to_datetime: str) -> list[str]:
+    # List keys with datetime filtering
+    # Accepts: YYYY-MM-DD or YYYY-MM-DDTHH:MM format
+    try:
+        # Try parsing with time
+        if 'T' in from_datetime:
+            start = datetime.strptime(from_datetime, "%Y-%m-%dT%H:%M")
+            end = datetime.strptime(to_datetime, "%Y-%m-%dT%H:%M")
+        else:
+            # Fallback to date only
+            start = datetime.strptime(from_datetime, "%Y-%m-%d")
+            end = datetime.strptime(to_datetime, "%Y-%m-%d")
+    except ValueError:
         return []
-    keys = []
+    
+    if end < start:
+        return []
+    
+    # Collect all frames from date range
+    days = (end.date() - start.date()).days
+    all_keys = []
     for i in range(days + 1):
-        d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+        d = (start.date() + timedelta(days=i)).strftime("%Y-%m-%d")
         prefix = f"{INPUT_PREFIX}/{camera}/{d}/"
         objs = list_objects(prefix)
-        # sort by key name (already timestamp-based)
         day_keys = [o["Key"] for o in objs]
-        day_keys.sort()
-        keys.extend(day_keys)
-    return keys
+        all_keys.extend(day_keys)
+    
+    # Filter by time if specified
+    if 'T' in from_datetime:
+        filtered_keys = []
+        for key in all_keys:
+            # Extract timestamp from key: camera1_20251126_153000.jpg
+            try:
+                parts = key.split('/')[-1].split('_')
+                if len(parts) >= 3:
+                    date_str = parts[1]
+                    time_str = parts[2].split('.')[0]
+                    frame_dt = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
+                    if start <= frame_dt <= end:
+                        filtered_keys.append(key)
+            except:
+                continue
+        return sorted(filtered_keys)
+    
+    return sorted(all_keys)
 
 
 def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> bool:
@@ -585,7 +617,10 @@ def generate():
         return jsonify({"error": "No frames found in range"}), 404
 
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    out_name = f"{camera}_timelapse_{from_date}_to_{to_date}_{ts}.mp4"
+    # Clean datetime strings for filename
+    from_clean = from_date.replace('T', '_').replace(':', '')
+    to_clean = to_date.replace('T', '_').replace(':', '')
+    out_name = f"{camera}_timelapse_{from_clean}_to_{to_clean}_{ts}.mp4"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_out = os.path.join(tmpdir, out_name)
