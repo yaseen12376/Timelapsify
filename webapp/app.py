@@ -807,11 +807,20 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
         # Both request and video timestamps are in IST - no conversion needed
         temp_files = []
         
-        for i, v in enumerate(videos):
-            # Download
+        # Download all videos in parallel for speed
+        def download_video(i, v):
             local_filename = f"temp_{i}.mp4"
             logging.info(f"Downloading {v['key']}...")
             client.download_file(S3_BUCKET_NAME, v['key'], local_filename)
+            return i, local_filename, v
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            downloads = list(executor.map(lambda iv: download_video(iv[0], iv[1]), enumerate(videos)))
+        
+        # Sort by index to maintain order
+        downloads.sort(key=lambda x: x[0])
+        
+        for i, local_filename, v in downloads:
             
             # Calculate trim points (all in IST)
             vid_start = v['start_ist']
@@ -828,18 +837,15 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
             if duration <= 0:
                 continue
                 
-            # Trim with fast encoding
+            # Trim using stream copy (no re-encoding) for maximum speed
             trimmed_filename = f"trim_{i}.mp4"
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start_offset),
                 "-t", str(duration),
                 "-i", local_filename,
-                "-c:v", "libx264",  # Re-encode for better compression
-                "-preset", "ultrafast",  # Fastest encoding preset
-                "-crf", "28",  # Higher CRF = smaller file, faster upload
-                "-c:a", "aac",  # Audio codec
-                "-b:a", "128k",  # Lower audio bitrate
+                "-c", "copy",  # Stream copy - no re-encoding, extremely fast
+                "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
                 trimmed_filename
             ]
             logging.info(f"Trimming video {i}: start={start_offset}, dur={duration}")
@@ -857,20 +863,34 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
                 for tf in temp_files:
                     f.write(f"file '{tf}'\n")
             
+            # Try stream copy first (fastest), fallback to re-encoding if needed
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", "list.txt",
-                "-c:v", "libx264",  # Re-encode for consistency
-                "-preset", "ultrafast",  # Fastest preset
-                "-crf", "28",  # Compression
-                "-c:a", "aac",
-                "-b:a", "128k",
+                "-c", "copy",  # Stream copy for maximum speed
                 output_path
             ]
-            logging.info("Merging videos...")
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logging.info("Merging videos with stream copy...")
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            
+            # If stream copy fails, fallback to fast re-encoding
+            if result.returncode != 0:
+                logging.warning("Stream copy failed, re-encoding...")
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", "list.txt",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",  # Faster than ultrafast with better compression
+                    "-crf", "23",  # Better quality, reasonable speed
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    output_path
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             # Cleanup
             for tf in temp_files:
@@ -1042,9 +1062,9 @@ def generate():
                     
                     # Optimized transfer config for faster uploads
                     config = TransferConfig(
-                        multipart_threshold=5 * 1024 * 1024,  # 5MB threshold
-                        max_concurrency=10,  # More concurrent uploads
-                        multipart_chunksize=5 * 1024 * 1024,  # 5MB chunks (smaller than default)
+                        multipart_threshold=8 * 1024 * 1024,  # 8MB threshold
+                        max_concurrency=20,  # Maximum concurrent uploads
+                        multipart_chunksize=8 * 1024 * 1024,  # 8MB chunks for optimal speed
                         use_threads=True
                     )
                     
@@ -1110,9 +1130,9 @@ def generate():
         
         # Optimized upload config for timelapse
         config = TransferConfig(
-            multipart_threshold=5 * 1024 * 1024,
-            max_concurrency=10,
-            multipart_chunksize=5 * 1024 * 1024,
+            multipart_threshold=8 * 1024 * 1024,
+            max_concurrency=20,
+            multipart_chunksize=8 * 1024 * 1024,
             use_threads=True
         )
         
