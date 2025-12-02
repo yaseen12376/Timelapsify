@@ -21,6 +21,7 @@ from src.s3_utils import list_objects, upload_file, presigned_url, generate_s3_h
 
 import subprocess
 import traceback
+from boto3.s3.transfer import TransferConfig
 
 
 
@@ -28,6 +29,7 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 INPUT_PREFIX = "Timelapse input"
 OUTPUT_PREFIX = "Timelapse output"
+HISTORY_TRIMMER_PREFIX = "ppe-detection-videos/history_trimmer"
 VIDEO_PREFIX = "ppe-detection-videos"
 TZ = pytz.timezone("Asia/Kolkata")
 SGT = pytz.timezone("Asia/Singapore")
@@ -826,14 +828,18 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
             if duration <= 0:
                 continue
                 
-            # Trim
+            # Trim with fast encoding
             trimmed_filename = f"trim_{i}.mp4"
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start_offset),
                 "-t", str(duration),
                 "-i", local_filename,
-                "-c", "copy", # Fast copy
+                "-c:v", "libx264",  # Re-encode for better compression
+                "-preset", "ultrafast",  # Fastest encoding preset
+                "-crf", "28",  # Higher CRF = smaller file, faster upload
+                "-c:a", "aac",  # Audio codec
+                "-b:a", "128k",  # Lower audio bitrate
                 trimmed_filename
             ]
             logging.info(f"Trimming video {i}: start={start_offset}, dur={duration}")
@@ -856,7 +862,11 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
                 "-f", "concat",
                 "-safe", "0",
                 "-i", "list.txt",
-                "-c", "copy",
+                "-c:v", "libx264",  # Re-encode for consistency
+                "-preset", "ultrafast",  # Fastest preset
+                "-crf", "28",  # Compression
+                "-c:a", "aac",
+                "-b:a", "128k",
                 output_path
             ]
             logging.info("Merging videos...")
@@ -1026,10 +1036,27 @@ def generate():
             os.chdir(tmpdir)
             try:
                 if process_videos(videos, from_date, to_date, base_name):
-                    # Upload result
-                    s3_key = f"{OUTPUT_PREFIX}/{base_name}"
+                    # Upload result to history_trimmer folder with optimized config
+                    s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
                     logging.info(f"Uploading result to {s3_key}...")
-                    s3_uri = upload_file(base_name, s3_key, content_type="video/mp4")
+                    
+                    # Optimized transfer config for faster uploads
+                    config = TransferConfig(
+                        multipart_threshold=5 * 1024 * 1024,  # 5MB threshold
+                        max_concurrency=10,  # More concurrent uploads
+                        multipart_chunksize=5 * 1024 * 1024,  # 5MB chunks (smaller than default)
+                        use_threads=True
+                    )
+                    
+                    # Use direct boto3 upload with config
+                    client.upload_file(
+                        base_name,
+                        S3_BUCKET_NAME,
+                        s3_key,
+                        ExtraArgs={'ContentType': 'video/mp4'},
+                        Config=config
+                    )
+                    s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
                     url = generate_s3_http_url(s3_key)
                     
                     download_url = client.generate_presigned_url(
@@ -1080,7 +1107,23 @@ def generate():
             return jsonify({"error": "Failed to build timelapse (no encoder available)"}), 500
         file_name = os.path.basename(actual_path)
         s3_key = f"{OUTPUT_PREFIX}/{file_name}"
-        s3_uri = upload_file(actual_path, s3_key, content_type=mime)
+        
+        # Optimized upload config for timelapse
+        config = TransferConfig(
+            multipart_threshold=5 * 1024 * 1024,
+            max_concurrency=10,
+            multipart_chunksize=5 * 1024 * 1024,
+            use_threads=True
+        )
+        
+        client.upload_file(
+            actual_path,
+            S3_BUCKET_NAME,
+            s3_key,
+            ExtraArgs={'ContentType': mime},
+            Config=config
+        )
+        s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
         url = generate_s3_http_url(s3_key)
         
         # Generate presigned URL with content-disposition for forced download
