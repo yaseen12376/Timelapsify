@@ -1221,7 +1221,7 @@ def generate():
         logging.info(f"Last frame: {keys[-1]}")
     
     if not keys:
-        return jsonify({"error": "No frames found in range"}), 404
+        return jsonify({"error": "No frames found in range"}), 200
 
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
     # Clean datetime strings for filename
@@ -1317,7 +1317,7 @@ def retrieve_history():
 
     videos = list_video_keys(camera_name, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"))
     if not videos:
-        return jsonify({"error": "No videos found in range"}), 404
+        return jsonify({"error": "No videos found in range"}), 200
 
     ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
     base_name = f"{camera_name}_retrieved_{start_dt_ist.strftime('%Y-%m-%d_%H%M')}_to_{end_dt_ist.strftime('%Y-%m-%d_%H%M')}_{ts}.mp4"
