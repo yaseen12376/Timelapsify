@@ -11,6 +11,7 @@ from flask import Flask, request, render_template_string, jsonify, redirect, Res
 from flask_cors import CORS
 from dotenv import load_dotenv
 import pytz
+import re
 
 # Add parent directory to path to import src module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -375,16 +376,23 @@ TEMPLATE = """
         
         <form method="post" action="/generate" id="timelapseForm">
             <input type="hidden" name="mode" id="modeInput" value="timelapse">
-            <div class="form-group" id="presetTimesGroup" style="display:none;">
-                <label>⏰ Preset Time Ranges</label>
-                <div class="quick-select">
-                    {% for preset in preset_times %}
-                    <button type="button" class="quick-btn" onclick="setPresetTime('{{preset.from}}', '{{preset.to}}')">{{preset.label}}</button>
-                    {% endfor %}
+            <div class="form-group" id="retrieveInputsGroup" style="display:none;">
+                <label>🔗 Video URL (presigned)</label>
+                <input type="url" id="video_url" name="video_url" placeholder="https://...mp4?X-Amz-..." />
+                <div style="margin-top:12px; display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                    <div>
+                        <label for="clip_start">🎞️ Clip Start (MM:SS)</label>
+                        <input type="text" id="clip_start" name="clip_start" placeholder="0:13" />
+                    </div>
+                    <div>
+                        <label for="clip_end">🏁 Clip End (MM:SS)</label>
+                        <input type="text" id="clip_end" name="clip_end" placeholder="1:45" />
+                    </div>
                 </div>
+                <p class="subtitle" style="margin-top:10px;">Enter start/end relative to the provided video.</p>
             </div>
             
-            <div class="form-group">
+            <div class="form-group" id="dateRangeGroup">
                 <label>📅 Date Range</label>
                 <div class="quick-select">
                     <button type="button" class="quick-btn" onclick="setRange('today')">Today</button>
@@ -396,12 +404,12 @@ TEMPLATE = """
                 </div>
             </div>
             
-            <div class="form-group">
+            <div class="form-group" id="fromDateGroup">
                 <label for="from_date">From Date & Time</label>
                 <input type="datetime-local" id="from_date" name="from_date" required>
             </div>
             
-            <div class="form-group">
+            <div class="form-group" id="toDateGroup">
                 <label for="to_date">To Date & Time</label>
                 <input type="datetime-local" id="to_date" name="to_date" required>
             </div>
@@ -411,7 +419,7 @@ TEMPLATE = """
                 <input type="number" id="duration" name="duration" min="1" max="300" value="10" required>
             </div>
             
-            <div class="form-group">
+            <div class="form-group" id="cameraGroup">
                 <label>📷 Select Camera</label>
                 <div class="camera-grid">
                     {% for cam in cameras %}
@@ -457,21 +465,33 @@ TEMPLATE = """
             document.getElementById('modeInput').value = mode;
             const toggle = document.getElementById('modeToggle');
             const durationGroup = document.getElementById('durationGroup');
-            const presetTimesGroup = document.getElementById('presetTimesGroup');
+            const retrieveInputsGroup = document.getElementById('retrieveInputsGroup');
+            const dateRangeGroup = document.getElementById('dateRangeGroup');
+            const fromDateGroup = document.getElementById('fromDateGroup');
+            const toDateGroup = document.getElementById('toDateGroup');
+            const cameraGroup = document.getElementById('cameraGroup');
             const submitBtn = document.querySelector('button[type="submit"]');
             const btns = document.querySelectorAll('.mode-btn');
             
             if (mode === 'retrieve') {
                 toggle.classList.add('retrieve');
                 durationGroup.style.display = 'none';
-                presetTimesGroup.style.display = 'block';
+                retrieveInputsGroup.style.display = 'block';
+                dateRangeGroup.style.display = 'none';
+                fromDateGroup.style.display = 'none';
+                toDateGroup.style.display = 'none';
+                cameraGroup.style.display = 'none';
                 submitBtn.textContent = '🔍 Find Videos';
                 btns[0].classList.remove('active');
                 btns[1].classList.add('active');
             } else {
                 toggle.classList.remove('retrieve');
                 durationGroup.style.display = 'block';
-                presetTimesGroup.style.display = 'none';
+                retrieveInputsGroup.style.display = 'none';
+                dateRangeGroup.style.display = 'block';
+                fromDateGroup.style.display = 'block';
+                toDateGroup.style.display = 'block';
+                cameraGroup.style.display = 'block';
                 submitBtn.textContent = '🎥 Generate Timelapse';
                 btns[0].classList.add('active');
                 btns[1].classList.remove('active');
@@ -494,8 +514,15 @@ TEMPLATE = """
             if (firstCamera) {
                 firstCamera.classList.add('selected');
             }
-            // Set today as default dates
+            // Set today as default dates for timelapse mode
             setRange('today');
+            // Set default retrieve input values
+            const clipStart = document.getElementById('clip_start');
+            const clipEnd = document.getElementById('clip_end');
+            if (clipStart && clipEnd) {
+                clipStart.value = '0:00';
+                clipEnd.value = '1:00';
+            }
         });
         
         function selectCamera(element, camera) {
@@ -562,22 +589,34 @@ TEMPLATE = """
             try {
                 let response, data;
                 if (currentMode === 'retrieve') {
-                    // Build JSON payload for /retrieve-history
-                    const camInput = document.querySelector('input[name="camera"]:checked');
-                    const cameraNum = camInput && camInput.value ? camInput.value.replace('camera', '') : '1';
-                    const fromVal = document.getElementById('from_date').value; // yyyy-MM-ddTHH:mm
-                    const toVal = document.getElementById('to_date').value;
-                    function toMMDDYYYY_HHMMSS(v) {
-                        const [datePart, timePart] = v.split('T');
-                        const [y, m, d] = datePart.split('-');
-                        const [hh, mm] = timePart.split(':');
-                        return `${m}/${d}/${y}, ${hh}:${mm}:00`;
+                    // Build new JSON payload for /retrieve-history (trim by URL)
+                    const urlVal = document.getElementById('video_url').value;
+                    const startClip = document.getElementById('clip_start').value.trim();
+                    const endClip = document.getElementById('clip_end').value.trim();
+                    function parseToSeconds(txt) {
+                        const parts = txt.split(':').map(p => p.trim());
+                        if (parts.length === 2) {
+                            const mm = parseInt(parts[0], 10);
+                            const ss = parseInt(parts[1], 10);
+                            return (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
+                        } else if (parts.length === 3) {
+                            const hh = parseInt(parts[0], 10);
+                            const mm = parseInt(parts[1], 10);
+                            const ss = parseInt(parts[2], 10);
+                            return (isNaN(hh)?0:hh) * 3600 + (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
+                        }
+                        return 0;
                     }
+                    const startSec = parseToSeconds(startClip);
+                    const endSec = parseToSeconds(endClip);
+                    const selSec = Math.max(0, endSec - startSec);
+                    const mm = Math.floor(selSec / 60);
+                    const ss = String(selSec % 60).padStart(2, '0');
                     const payload = {
-                        camera: cameraNum,
-                        startTime: toMMDDYYYY_HHMMSS(fromVal),
-                        endTime: toMMDDYYYY_HHMMSS(toVal),
-                        mail: ''
+                        StartDateTime: startClip,
+                        EndDateTime: endClip,
+                        SelectedDuration: `${mm}:${ss}`,
+                        currnturl: urlVal
                     };
                     response = await fetch('/retrieve-history', {
                         method: 'POST',
@@ -601,8 +640,7 @@ TEMPLATE = """
                             <div class="url-box">${data.StartDateTime} → ${data.EndDateTime}</div>
                             <div class="url-label">Selected Duration</div>
                             <div class="url-box">${data.SelectedDuration}</div>
-                            <div class="url-label">Total Duration</div>
-                            <div class="url-box">${data['Total duaration']}</div>
+                            <a id="downloadBtn" href="${data.download_url}" class="download-btn" download style="display:block; text-align:center; margin-top:10px;">📥 Download Trimmed Clip</a>
                         `;
                         document.getElementById('result').innerHTML = html;
                         document.getElementById('result').classList.add('show');
@@ -832,6 +870,75 @@ def _supports_http_range(url: str) -> bool:
             return True
         return False
     except Exception:
+        return False
+
+def _parse_clip_time_to_seconds(txt: str) -> int:
+    """Parse 'MM:SS' or 'HH:MM:SS' to total seconds. Returns 0 on error."""
+    try:
+        txt = txt.strip()
+        parts = txt.split(":")
+        if len(parts) == 2:
+            mm = int(parts[0])
+            ss = int(parts[1])
+            return mm * 60 + ss
+        elif len(parts) == 3:
+            hh = int(parts[0])
+            mm = int(parts[1])
+            ss = int(parts[2])
+            return hh * 3600 + mm * 60 + ss
+        else:
+            return 0
+    except Exception:
+        return 0
+
+def _format_seconds_mmss(total_sec: int) -> str:
+    total_sec = max(0, int(total_sec))
+    return f"{total_sec // 60}:{str(total_sec % 60).zfill(2)}"
+
+def _extract_total_duration_from_url(url: str) -> str | None:
+    """Try to compute total duration from filename pattern _YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 in URL."""
+    try:
+        m = re.search(r"(\d{14})_(\d{14})\.mp4", url)
+        if not m:
+            return None
+        start_str, end_str = m.group(1), m.group(2)
+        start_dt = datetime.strptime(start_str, "%Y%m%d%H%M%S")
+        end_dt = datetime.strptime(end_str, "%Y%m%d%H%M%S")
+        return _format_seconds_mmss(int((end_dt - start_dt).total_seconds()))
+    except Exception:
+        return None
+
+def trim_video_by_url(presigned_url: str, start_offset_sec: int, end_offset_sec: int, output_path: str) -> bool:
+    """Trim a single S3 video by presigned URL using HTTP range stream copy."""
+    try:
+        duration = max(0, end_offset_sec - start_offset_sec)
+        if duration <= 0:
+            logging.error("Invalid trim window: non-positive duration")
+            return False
+        # Use accurate seek with re-encoding to avoid keyframe rounding issues
+        cmd = [
+            "ffmpeg", "-y",
+            "-rw_timeout", "30000000",
+            "-i", presigned_url,
+            "-ss", str(start_offset_sec),
+            "-t", str(duration),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        logging.info(f"Trimming via URL (re-encode): start={start_offset_sec}s, duration={duration}s")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            logging.error("ffmpeg trim failed for URL input")
+            logging.error(result.stderr.decode(errors='ignore'))
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"URL trim failed: {e}")
         return False
 
 def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, output_path: str) -> bool:
@@ -1289,102 +1396,171 @@ def generate():
 
 @app.route("/retrieve-history", methods=["POST"])
 def retrieve_history():
+    # Accept both old and new payloads; prefer new trim-by-URL when present
     try:
         payload = request.get_json(force=True)
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    camera_id = str(payload.get("camera", "")).strip()
-    start_str = payload.get("startTime")
-    end_str = payload.get("endTime")
-    mail = payload.get("mail")
+    new_url = payload.get("currnturl")
+    start_clip_txt = payload.get("StartDateTime")
+    end_clip_txt = payload.get("EndDateTime")
 
-    if not camera_id or not start_str or not end_str:
-        return jsonify({"error": "Missing required fields: camera, startTime, endTime"}), 400
+    if new_url and start_clip_txt and end_clip_txt:
+        # New behavior: trim single URL by relative MM:SS window
+        start_sec = _parse_clip_time_to_seconds(str(start_clip_txt))
+        end_sec = _parse_clip_time_to_seconds(str(end_clip_txt))
+        if end_sec <= start_sec:
+            return jsonify({"error": "EndDateTime must be after StartDateTime"}), 400
 
-    camera_name = f"camera{camera_id}"
-    if camera_name not in CAMERAS:
-        return jsonify({"error": "Invalid camera"}), 400
+        # Derive a camera label from URL if possible
+        camera_match = re.search(r"/(camera\d+)/", new_url)
+        camera_label = camera_match.group(1) if camera_match else "cameraX"
+        ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        base_name = f"{camera_label}_retrieved_{str(start_clip_txt).replace(':','-')}_to_{str(end_clip_txt).replace(':','-')}_{ts}.mp4"
 
-    try:
-        start_dt_ist = IST.localize(datetime.strptime(start_str, "%m/%d/%Y, %H:%M:%S"))
-        end_dt_ist = IST.localize(datetime.strptime(end_str, "%m/%d/%Y, %H:%M:%S"))
-    except ValueError:
-        return jsonify({"error": "Invalid datetime format. Use MM/DD/YYYY, HH:MM:SS"}), 400
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                ok = trim_video_by_url(new_url, start_sec, end_sec, base_name)
+                if not ok:
+                    return jsonify({"error": "Failed to process video via URL trim"}), 500
 
-    if end_dt_ist <= start_dt_ist:
-        return jsonify({"error": "endTime must be after startTime"}), 400
+                s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
+                config = TransferConfig(
+                    multipart_threshold=8 * 1024 * 1024,
+                    max_concurrency=20,
+                    multipart_chunksize=8 * 1024 * 1024,
+                    use_threads=True
+                )
+                client.upload_file(
+                    base_name,
+                    S3_BUCKET_NAME,
+                    s3_key,
+                    ExtraArgs={'ContentType': 'video/mp4'},
+                    Config=config
+                )
+                presigned = client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': S3_BUCKET_NAME,
+                        'Key': s3_key,
+                        'ResponseContentType': 'video/mp4'
+                    },
+                    ExpiresIn=3600
+                )
+                download_url = client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': S3_BUCKET_NAME,
+                        'Key': s3_key,
+                        'ResponseContentDisposition': f'attachment; filename="{base_name}"',
+                        'ResponseContentType': 'video/mp4'
+                    },
+                    ExpiresIn=3600
+                )
 
-    videos = list_video_keys(camera_name, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"))
-    if not videos:
-        return jsonify({"error": "No videos found in range"}), 200
+                selected_mmss = payload.get("SelectedDuration") or _format_seconds_mmss(end_sec - start_sec)
+                return jsonify({
+                    "StartDateTime": str(start_clip_txt),
+                    "EndDateTime": str(end_clip_txt),
+                    "SelectedDuration": selected_mmss,
+                    "currnturl": presigned,
+                    "download_url": download_url
+                })
+            finally:
+                os.chdir(cwd)
+    else:
+        # Fallback to old behavior using camera + date/time payload
+        camera_id = str(payload.get("camera", "")).strip()
+        start_str = payload.get("startTime")
+        end_str = payload.get("endTime")
+        mail = payload.get("mail")
 
-    ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    base_name = f"{camera_name}_retrieved_{start_dt_ist.strftime('%Y-%m-%d_%H%M')}_to_{end_dt_ist.strftime('%Y-%m-%d_%H%M')}_{ts}.mp4"
+        if not camera_id or not start_str or not end_str:
+            return jsonify({"error": "Missing required fields: camera, startTime, endTime"}), 400
 
-    selected_duration_sec = int((end_dt_ist - start_dt_ist).total_seconds())
-    selected_duration_mmss = f"{selected_duration_sec // 60}:{str(selected_duration_sec % 60).zfill(2)}"
-    try:
-        total_duration_sec = int((videos[0]['end_ist'] - videos[0]['start_ist']).total_seconds())
-        total_duration_mmss = f"{total_duration_sec // 60}:{str(total_duration_sec % 60).zfill(2)}"
-    except Exception:
-        total_duration_mmss = "59:59"
+        camera_name = f"camera{camera_id}"
+        if camera_name not in CAMERAS:
+            return jsonify({"error": "Invalid camera"}), 400
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        cwd = os.getcwd()
-        os.chdir(tmpdir)
         try:
-            ok = process_videos(videos, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"), base_name)
-            if not ok:
-                return jsonify({"error": "Failed to process videos"}), 500
+            start_dt_ist = IST.localize(datetime.strptime(start_str, "%m/%d/%Y, %H:%M:%S"))
+            end_dt_ist = IST.localize(datetime.strptime(end_str, "%m/%d/%Y, %H:%M:%S"))
+        except ValueError:
+            return jsonify({"error": "Invalid datetime format. Use MM/DD/YYYY, HH:MM:SS"}), 400
 
-            s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
-            config = TransferConfig(
-                multipart_threshold=8 * 1024 * 1024,
-                max_concurrency=20,
-                multipart_chunksize=8 * 1024 * 1024,
-                use_threads=True
-            )
-            client.upload_file(
-                base_name,
-                S3_BUCKET_NAME,
-                s3_key,
-                ExtraArgs={'ContentType': 'video/mp4'},
-                Config=config
-            )
-            # Generate a time-limited presigned URL to avoid 403
-            presigned = client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': S3_BUCKET_NAME,
-                    'Key': s3_key,
-                    'ResponseContentType': 'video/mp4'
-                },
-                ExpiresIn=3600
-            )
+        if end_dt_ist <= start_dt_ist:
+            return jsonify({"error": "endTime must be after startTime"}), 400
 
-            # Separate download URL with content-disposition attachment
-            download_url = client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': S3_BUCKET_NAME,
-                    'Key': s3_key,
-                    'ResponseContentDisposition': f'attachment; filename="{base_name}"',
-                    'ResponseContentType': 'video/mp4'
-                },
-                ExpiresIn=3600
-            )
+        videos = list_video_keys(camera_name, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"))
+        if not videos:
+            return jsonify({"error": "No videos found in range"}), 200
 
-            return jsonify({
-                "StartDateTime": start_dt_ist.strftime("%H:%M"),
-                "EndDateTime": end_dt_ist.strftime("%H:%M"),
-                "SelectedDuration": selected_duration_mmss,
-                "Total duaration": total_duration_mmss,
-                "currnturl": presigned,
-                "download_url": download_url
-            })
-        finally:
-            os.chdir(cwd)
+        ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        base_name = f"{camera_name}_retrieved_{start_dt_ist.strftime('%Y-%m-%d_%H%M')}_to_{end_dt_ist.strftime('%Y-%m-%d_%H%M')}_{ts}.mp4"
+
+        selected_duration_sec = int((end_dt_ist - start_dt_ist).total_seconds())
+        selected_duration_mmss = f"{selected_duration_sec // 60}:{str(selected_duration_sec % 60).zfill(2)}"
+        try:
+            total_duration_sec = int((videos[0]['end_ist'] - videos[0]['start_ist']).total_seconds())
+            total_duration_mmss = f"{total_duration_sec // 60}:{str(total_duration_sec % 60).zfill(2)}"
+        except Exception:
+            total_duration_mmss = "59:59"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                ok = process_videos(videos, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"), base_name)
+                if not ok:
+                    return jsonify({"error": "Failed to process videos"}), 500
+
+                s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
+                config = TransferConfig(
+                    multipart_threshold=8 * 1024 * 1024,
+                    max_concurrency=20,
+                    multipart_chunksize=8 * 1024 * 1024,
+                    use_threads=True
+                )
+                client.upload_file(
+                    base_name,
+                    S3_BUCKET_NAME,
+                    s3_key,
+                    ExtraArgs={'ContentType': 'video/mp4'},
+                    Config=config
+                )
+                presigned = client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': S3_BUCKET_NAME,
+                        'Key': s3_key,
+                        'ResponseContentType': 'video/mp4'
+                    },
+                    ExpiresIn=3600
+                )
+                download_url = client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': S3_BUCKET_NAME,
+                        'Key': s3_key,
+                        'ResponseContentDisposition': f'attachment; filename="{base_name}"',
+                        'ResponseContentType': 'video/mp4'
+                    },
+                    ExpiresIn=3600
+                )
+
+                return jsonify({
+                    "StartDateTime": start_dt_ist.strftime("%H:%M"),
+                    "EndDateTime": end_dt_ist.strftime("%H:%M"),
+                    "SelectedDuration": selected_duration_mmss,
+                    "Total duaration": total_duration_mmss,
+                    "currnturl": presigned,
+                    "download_url": download_url
+                })
+            finally:
+                os.chdir(cwd)
 
 
 if __name__ == "__main__":
