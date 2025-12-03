@@ -49,7 +49,11 @@ PRESET_TIMES = [
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
+# Suppress noisy lower-level debug logs
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('s3transfer').setLevel(logging.WARNING)
 
 TEMPLATE = """
 <!doctype html>
@@ -554,61 +558,81 @@ TEMPLATE = """
             const formData = new FormData(this);
             
             try {
-                const response = await fetch('/generate', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                const data = await response.json();
-                
-                document.getElementById('loading').style.display = 'none';
-                
-                if (response.ok) {
-                    if (data.mode === 'retrieve') {
-                        let html = '<h3>✅ Video Processed Successfully!</h3>';
-                        
-                        // Add video player
-                        html += `
+                let response, data;
+                if (currentMode === 'retrieve') {
+                    // Build JSON payload for /retrieve-history
+                    const camInput = document.querySelector('input[name="camera"]:checked');
+                    const cameraNum = camInput && camInput.value ? camInput.value.replace('camera', '') : '1';
+                    const fromVal = document.getElementById('from_date').value; // yyyy-MM-ddTHH:mm
+                    const toVal = document.getElementById('to_date').value;
+                    function toMMDDYYYY_HHMMSS(v) {
+                        const [datePart, timePart] = v.split('T');
+                        const [y, m, d] = datePart.split('-');
+                        const [hh, mm] = timePart.split(':');
+                        return `${m}/${d}/${y}, ${hh}:${mm}:00`;
+                    }
+                    const payload = {
+                        camera: cameraNum,
+                        startTime: toMMDDYYYY_HHMMSS(fromVal),
+                        endTime: toMMDDYYYY_HHMMSS(toVal),
+                        mail: ''
+                    };
+                    response = await fetch('/retrieve-history', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    data = await response.json();
+                    document.getElementById('loading').style.display = 'none';
+                    if (response.ok) {
+                        let html = `
+                            <h3>✅ Clip Retrieved</h3>
                             <div style="margin-bottom: 20px;">
                                 <video width="100%" controls autoplay>
-                                    <source src="${data.url}" type="video/mp4">
+                                    <source src="${data.currnturl}" type="video/mp4">
                                     Your browser does not support the video tag.
                                 </video>
                             </div>
+                            <div class="url-label">Current URL</div>
+                            <div class="url-box" id="httpUrl">${data.currnturl}</div>
+                            <div class="url-label">Window</div>
+                            <div class="url-box">${data.StartDateTime} → ${data.EndDateTime}</div>
+                            <div class="url-label">Selected Duration</div>
+                            <div class="url-box">${data.SelectedDuration}</div>
+                            <div class="url-label">Total Duration</div>
+                            <div class="url-box">${data['Total duaration']}</div>
                         `;
-                        
-                        html += `
-                            <a href="${data.download_url}" class="download-btn" style="display:block; text-align:center; margin-bottom:20px;">📥 Download Processed Video</a>
-                            
-                            <div class="url-label">S3 URI</div>
-                            <div class="url-box" id="s3Uri">${data.s3_uri}</div>
-                            <div class="url-label">Download URL</div>
-                            <div class="url-box" id="httpUrl">${data.url}</div>
-                        `;
-                        
                         document.getElementById('result').innerHTML = html;
+                        document.getElementById('result').classList.add('show');
                     } else {
+                        document.getElementById('error').textContent = data.error || 'Failed to retrieve clip';
+                        document.getElementById('error').classList.add('show');
+                    }
+                } else {
+                    const responseGen = await fetch('/generate', { method: 'POST', body: formData });
+                    const dataGen = await responseGen.json();
+                    document.getElementById('loading').style.display = 'none';
+                    if (responseGen.ok) {
                         const resultHtml = `
                             <h3>✅ Timelapse Generated Successfully!</h3>
                             
-                            <a id="downloadBtn" href="${data.download_url}" class="download-btn" download="${data.filename}" style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
+                            <a id="downloadBtn" href="${dataGen.download_url}" class="download-btn" download="${dataGen.filename}" style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
                             
                             <div class="url-label">S3 URI</div>
-                            <div class="url-box" id="s3Uri">${data.s3_uri}</div>
+                            <div class="url-box" id="s3Uri">${dataGen.s3_uri}</div>
                             <div class="url-label">Download URL</div>
-                            <div class="url-box" id="httpUrl">${data.url}</div>
+                            <div class="url-box" id="httpUrl">${dataGen.url}</div>
                             <div style="margin-top: 10px;">
                                 <button class="copy-btn" onclick="copyUrl('s3')">Copy S3 URI</button>
                                 <button class="copy-btn" onclick="copyUrl('http')">Copy URL</button>
                             </div>
                         `;
                         document.getElementById('result').innerHTML = resultHtml;
+                        document.getElementById('result').classList.add('show');
+                    } else {
+                        document.getElementById('error').textContent = dataGen.error || 'An error occurred';
+                        document.getElementById('error').classList.add('show');
                     }
-
-                    document.getElementById('result').classList.add('show');
-                } else {
-                    document.getElementById('error').textContent = data.error || 'An error occurred';
-                    document.getElementById('error').classList.add('show');
                 }
             } catch (error) {
                 document.getElementById('loading').style.display = 'none';
@@ -1091,6 +1115,7 @@ def generate():
                     )
                     
                     return jsonify({
+                        # Keep legacy fields if someone still calls /generate with retrieve
                         "mode": "retrieve",
                         "s3_uri": s3_uri,
                         "url": url,
@@ -1159,12 +1184,111 @@ def generate():
         )
         
         return jsonify({
-            "mode": "timelapse",
             "s3_uri": s3_uri, 
             "url": url, 
             "download_url": download_url,
             "filename": file_name
         })
+
+
+@app.route("/retrieve-history", methods=["POST"])
+def retrieve_history():
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    camera_id = str(payload.get("camera", "")).strip()
+    start_str = payload.get("startTime")
+    end_str = payload.get("endTime")
+    mail = payload.get("mail")
+
+    if not camera_id or not start_str or not end_str:
+        return jsonify({"error": "Missing required fields: camera, startTime, endTime"}), 400
+
+    camera_name = f"camera{camera_id}"
+    if camera_name not in CAMERAS:
+        return jsonify({"error": "Invalid camera"}), 400
+
+    try:
+        start_dt_ist = IST.localize(datetime.strptime(start_str, "%m/%d/%Y, %H:%M:%S"))
+        end_dt_ist = IST.localize(datetime.strptime(end_str, "%m/%d/%Y, %H:%M:%S"))
+    except ValueError:
+        return jsonify({"error": "Invalid datetime format. Use MM/DD/YYYY, HH:MM:SS"}), 400
+
+    if end_dt_ist <= start_dt_ist:
+        return jsonify({"error": "endTime must be after startTime"}), 400
+
+    videos = list_video_keys(camera_name, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"))
+    if not videos:
+        return jsonify({"error": "No videos found in range"}), 404
+
+    ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+    base_name = f"{camera_name}_retrieved_{start_dt_ist.strftime('%Y-%m-%d_%H%M')}_to_{end_dt_ist.strftime('%Y-%m-%d_%H%M')}_{ts}.mp4"
+
+    selected_duration_sec = int((end_dt_ist - start_dt_ist).total_seconds())
+    selected_duration_mmss = f"{selected_duration_sec // 60}:{str(selected_duration_sec % 60).zfill(2)}"
+    try:
+        total_duration_sec = int((videos[0]['end_ist'] - videos[0]['start_ist']).total_seconds())
+        total_duration_mmss = f"{total_duration_sec // 60}:{str(total_duration_sec % 60).zfill(2)}"
+    except Exception:
+        total_duration_mmss = "59:59"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cwd = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            ok = process_videos(videos, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"), base_name)
+            if not ok:
+                return jsonify({"error": "Failed to process videos"}), 500
+
+            s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
+            config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024,
+                max_concurrency=20,
+                multipart_chunksize=8 * 1024 * 1024,
+                use_threads=True
+            )
+            client.upload_file(
+                base_name,
+                S3_BUCKET_NAME,
+                s3_key,
+                ExtraArgs={'ContentType': 'video/mp4'},
+                Config=config
+            )
+            # Generate a time-limited presigned URL to avoid 403
+            presigned = client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': S3_BUCKET_NAME,
+                    'Key': s3_key,
+                    'ResponseContentType': 'video/mp4'
+                },
+                ExpiresIn=3600
+            )
+
+            # Separate download URL with content-disposition attachment
+            download_url = client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': S3_BUCKET_NAME,
+                    'Key': s3_key,
+                    'ResponseContentDisposition': f'attachment; filename="{base_name}"',
+                    'ResponseContentType': 'video/mp4'
+                },
+                ExpiresIn=3600
+            )
+
+            return jsonify({
+                "StartDateTime": start_dt_ist.strftime("%H:%M"),
+                "EndDateTime": end_dt_ist.strftime("%H:%M"),
+                "SelectedDuration": selected_duration_mmss,
+                "Total duaration": total_duration_mmss,
+                "currnturl": presigned,
+                "download_url": download_url
+            })
+        finally:
+            os.chdir(cwd)
 
 
 if __name__ == "__main__":
