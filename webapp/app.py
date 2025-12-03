@@ -1196,6 +1196,17 @@ def generate():
         s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
         url = generate_s3_http_url(s3_key)
         
+        # Generate presigned URL suitable for inline playback (no attachment disposition)
+        play_url = client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': S3_BUCKET_NAME,
+                'Key': s3_key,
+                'ResponseContentType': mime
+            },
+            ExpiresIn=3600
+        )
+
         # Generate presigned URL with content-disposition for forced download
         download_url = client.generate_presigned_url(
             'get_object',
@@ -1210,7 +1221,8 @@ def generate():
         
         return jsonify({
             "s3_uri": s3_uri, 
-            "url": url, 
+            "url": url,
+            "play_url": play_url,
             "download_url": download_url,
             "filename": file_name
         })
