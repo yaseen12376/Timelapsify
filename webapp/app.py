@@ -961,36 +961,30 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
 def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> tuple[bool, str | None, str | None]:
     """Efficient timelapse builder.
     Optimizations:
-    - Direct S3 object download instead of VideoCapture on presigned URL.
+    - Direct S3 object download using boto3 (no presigned URL decode).
     - Parallel downloads using ThreadPoolExecutor.
     - Frame sampling to cap FPS (<=30) & total frames for requested duration.
+    - Prefer FFmpeg H.264 (yuv420p + faststart) via imageio with optional scaling.
     """
     if not frame_keys:
-        return False
+        return (False, None, None)
 
-    # Configurable workers - increased default for faster downloads
     max_workers = int(os.getenv("TIMELAPSE_MAX_WORKERS", "16"))
 
     total = len(frame_keys)
-    # Target fps capped at 30; if many frames, sample evenly
     target_fps = min(30, max(1, int(round(total / max(1, duration_sec)))))
-    # Limit frames so fps matches duration (avoid excessive unused frames)
     target_frame_count = min(total, target_fps * duration_sec)
     if target_frame_count < total:
-        # Even sampling of indices
         indices = np.linspace(0, total - 1, target_frame_count, dtype=int)
         frame_keys = [frame_keys[i] for i in indices]
         total = len(frame_keys)
-        # Recompute fps after sampling
         target_fps = max(1, min(30, int(round(total / max(1, duration_sec)))))
 
     def fetch_and_decode(idx_key_tuple):
-        """Optimized fetch with index for ordering"""
         idx, key = idx_key_tuple
         try:
             obj = client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
             data = obj['Body'].read()
-            # Faster decode with reduced quality checks
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if idx < 3:
@@ -1000,10 +994,8 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
             logging.error(f"Failed to fetch frame {idx} ({key}): {e}")
             return idx, None
 
-    # Parallel fetch with batch processing
     frames_dict = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all at once for better batching
         futures = [executor.submit(fetch_and_decode, (i, k)) for i, k in enumerate(frame_keys)]
         for future in as_completed(futures):
             idx, frame = future.result()
@@ -1013,16 +1005,83 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     if not frames_dict:
         return (False, None, None)
 
-    # Preserve order and write directly without intermediate list
     ordered_indices = sorted(frames_dict.keys())
     if not ordered_indices:
-        return False
+        return (False, None, None)
 
     first_img = frames_dict[ordered_indices[0]]
     h, w = first_img.shape[:2]
 
-    # Try multiple codecs/containers in order of preference
-    # Each tuple: (fourcc_str, extension, mime)
+    # Determine target resolution (optional upscaling)
+    target_w, target_h = w, h
+    try:
+        target_w_env = os.getenv("TIMELAPSE_TARGET_WIDTH")
+        target_h_env = os.getenv("TIMELAPSE_TARGET_HEIGHT")
+        min_w_env = os.getenv("TIMELAPSE_MIN_WIDTH")
+        min_h_env = os.getenv("TIMELAPSE_MIN_HEIGHT")
+
+        if target_w_env and target_h_env:
+            tw = int(target_w_env)
+            th = int(target_h_env)
+            if tw > 0 and th > 0:
+                target_w, target_h = tw, th
+        else:
+            scale = 1.0
+            if min_w_env:
+                mw = int(min_w_env)
+                if mw > 0:
+                    scale = max(scale, mw / w)
+            if min_h_env:
+                mh = int(min_h_env)
+                if mh > 0:
+                    scale = max(scale, mh / h)
+            if scale > 1.0:
+                target_w = int(round(w * scale))
+                target_h = int(round(h * scale))
+        # Ensure even dimensions for H.264 compatibility
+        if target_w % 2 != 0:
+            target_w += 1
+        if target_h % 2 != 0:
+            target_h += 1
+    except Exception as e:
+        logging.warning(f"Resolution selection error, using source size {w}x{h}: {e}")
+        target_w, target_h = w, h
+
+    base, _ext = os.path.splitext(output_path)
+    # Preferred: H.264 via imageio-ffmpeg
+    try:
+        import imageio
+        crf = os.getenv("TIMELAPSE_CRF", "20")
+        preset = os.getenv("TIMELAPSE_PRESET", "veryfast")
+        mp4_path = base + ".mp4"
+        logging.info(f"Attempting FFmpeg H.264 encode with CRF={crf}, preset={preset}, size={target_w}x{target_h}")
+        writer = imageio.get_writer(
+            mp4_path,
+            format="ffmpeg",
+            fps=target_fps,
+            codec="libx264",
+            ffmpeg_params=[
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-crf", str(crf),
+                "-preset", preset,
+                "-profile:v", "high", "-level", "4.2",
+            ],
+        )
+        for idx in ordered_indices:
+            frame = frames_dict[idx]
+            if frame.shape[1] != target_w or frame.shape[0] != target_h:
+                interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
+                frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            writer.append_data(frame_rgb)
+        writer.close()
+        logging.info(f"Encoded with FFmpeg H.264 -> {mp4_path} at {target_w}x{target_h}")
+        return (True, mp4_path, "video/mp4")
+    except Exception as e:
+        logging.warning(f"FFmpeg H.264 path not available, falling back to OpenCV encoders: {e}")
+
+    # Fallback: OpenCV codecs
     codec_options = [
         ("avc1", ".mp4", "video/mp4"),
         ("H264", ".mp4", "video/mp4"),
@@ -1031,7 +1090,6 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
         ("MJPG", ".avi", "video/x-msvideo"),
     ]
 
-    base, _ext = os.path.splitext(output_path)
     writer = None
     actual_path = None
     actual_mime = None
@@ -1039,7 +1097,7 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     for fourcc_str, ext, mime in codec_options:
         candidate_path = base + ext
         fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (w, h))
+        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (target_w, target_h))
         if out.isOpened():
             logging.info(f"Using codec {fourcc_str} -> {candidate_path}")
             writer = out
@@ -1047,7 +1105,6 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
             actual_mime = mime
             break
         else:
-            # Ensure it's released if not opened
             out.release()
             logging.warning(f"Failed to open VideoWriter with codec {fourcc_str} for {candidate_path}")
 
@@ -1055,12 +1112,14 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
         logging.error("No available video encoder found. Timelapse build aborted.")
         return (False, None, None)
 
-    # Write frames in order
-    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps})")
+    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps}, size: {target_w}x{target_h})")
     for i, idx in enumerate(ordered_indices):
-        writer.write(frames_dict[idx])
+        frame = frames_dict[idx]
+        if frame.shape[1] != target_w or frame.shape[0] != target_h:
+            interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
+        writer.write(frame)
         if i < 3 or i >= len(ordered_indices) - 3:
-            # Log first and last 3 frames with their keys
             key = frame_keys[idx]
             logging.info(f"Frame {i}: index={idx}, key={key.split('/')[-1]}")
 
