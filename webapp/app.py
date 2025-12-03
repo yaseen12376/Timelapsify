@@ -1090,7 +1090,7 @@ def generate():
     if mode == "retrieve":
         videos = list_video_keys(camera, from_date, to_date)
         if not videos:
-            return jsonify({"error": "No videos found in range"}), 404
+            return jsonify({"error": "No videos found in range"}), 200
             
         # Process videos (Trim & Merge)
         ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
