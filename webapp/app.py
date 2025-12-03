@@ -22,6 +22,8 @@ from src.s3_utils import list_objects, upload_file, presigned_url, generate_s3_h
 import subprocess
 import traceback
 from boto3.s3.transfer import TransferConfig
+import urllib.request
+from urllib.error import HTTPError
 
 
 
@@ -818,6 +820,20 @@ def list_video_keys(camera: str, from_datetime: str, to_datetime: str) -> list[d
     return sorted(found_videos, key=lambda x: x['start_ist'])
 
 
+def _supports_http_range(url: str) -> bool:
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-1"})
+        with urllib.request.urlopen(req) as resp:
+            # 206 Partial Content indicates range support
+            return resp.status == 206 or resp.getheader("Content-Range") is not None
+    except HTTPError as e:
+        # Some servers respond 206; if 200 without Content-Range, ranges unsupported
+        if e.code == 206:
+            return True
+        return False
+    except Exception:
+        return False
+
 def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, output_path: str) -> bool:
     """
     Downloads, trims, and merges videos to match the requested IST range.
@@ -831,20 +847,24 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
         # Both request and video timestamps are in IST - no conversion needed
         temp_files = []
         
-        # Download all videos in parallel for speed
-        def download_video(i, v):
-            local_filename = f"temp_{i}.mp4"
-            logging.info(f"Downloading {v['key']}...")
-            client.download_file(S3_BUCKET_NAME, v['key'], local_filename)
-            return i, local_filename, v
-        
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            downloads = list(executor.map(lambda iv: download_video(iv[0], iv[1]), enumerate(videos)))
-        
+        # Prepare presigned URLs and verify HTTP range support
+        prepared = []
+        logging.info("Preparing presigned URLs and verifying HTTP range support for streaming trims...")
+        for i, v in enumerate(videos):
+            presigned = client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': S3_BUCKET_NAME, 'Key': v['key']},
+                ExpiresIn=3600
+            )
+            if not _supports_http_range(presigned):
+                logging.error(f"Range streaming unsupported for {v['key']}. This server/object requires full download.")
+                raise RuntimeError("HTTP Range not supported: falling back would require full download, aborting per request.")
+            prepared.append((i, presigned, v))
+
         # Sort by index to maintain order
-        downloads.sort(key=lambda x: x[0])
-        
-        for i, local_filename, v in downloads:
+        prepared.sort(key=lambda x: x[0])
+
+        for i, presigned_url, v in prepared:
             
             # Calculate trim points (all in IST)
             vid_start = v['start_ist']
@@ -867,16 +887,20 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
                 "ffmpeg", "-y",
                 "-ss", str(start_offset),
                 "-t", str(duration),
-                "-i", local_filename,
-                "-c", "copy",  # Stream copy - no re-encoding, extremely fast
-                "-avoid_negative_ts", "make_zero",  # Fix timestamp issues
+                "-rw_timeout", "30000000",  # 30s read timeout
+                "-i", presigned_url,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
                 trimmed_filename
             ]
-            logging.info(f"Trimming video {i}: start={start_offset}, dur={duration}")
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logging.info(f"Streaming trim via HTTP ranges for clip {i}: start={start_offset}s, duration={duration}s")
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                logging.error(f"ffmpeg trim failed for clip {i}. The input may not support range seeks or moov-at-end.")
+                logging.error(result.stderr.decode(errors='ignore'))
+                raise RuntimeError("ffmpeg range trim failed: input not seekable or server rejected range requests.")
             
             temp_files.append(trimmed_filename)
-            os.remove(local_filename) # Clean up download
             
         if not temp_files:
             return False
@@ -924,6 +948,7 @@ def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, out
             # Just rename the single file
             os.rename(temp_files[0], output_path)
             
+        logging.info("All trims completed using streaming HTTP ranges; proceeding to merge.")
         return True
         
     except Exception as e:
