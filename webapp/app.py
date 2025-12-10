@@ -414,11 +414,6 @@ TEMPLATE = """
                 <input type="datetime-local" id="to_date" name="to_date" required>
             </div>
             
-            <div class="form-group" id="durationGroup">
-                <label for="duration">⏱️ Duration (seconds)</label>
-                <input type="number" id="duration" name="duration" min="1" max="300" value="10" required>
-            </div>
-            
             <div class="form-group" id="cameraGroup">
                 <label>📷 Select Camera</label>
                 <div class="camera-grid">
@@ -464,7 +459,6 @@ TEMPLATE = """
             currentMode = mode;
             document.getElementById('modeInput').value = mode;
             const toggle = document.getElementById('modeToggle');
-            const durationGroup = document.getElementById('durationGroup');
             const retrieveInputsGroup = document.getElementById('retrieveInputsGroup');
             const dateRangeGroup = document.getElementById('dateRangeGroup');
             const fromDateGroup = document.getElementById('fromDateGroup');
@@ -475,7 +469,6 @@ TEMPLATE = """
             
             if (mode === 'retrieve') {
                 toggle.classList.add('retrieve');
-                durationGroup.style.display = 'none';
                 retrieveInputsGroup.style.display = 'block';
                 dateRangeGroup.style.display = 'none';
                 fromDateGroup.style.display = 'none';
@@ -486,7 +479,6 @@ TEMPLATE = """
                 btns[1].classList.add('active');
             } else {
                 toggle.classList.remove('retrieve');
-                durationGroup.style.display = 'block';
                 retrieveInputsGroup.style.display = 'none';
                 dateRangeGroup.style.display = 'block';
                 fromDateGroup.style.display = 'block';
@@ -1070,7 +1062,7 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     Optimizations:
     - Direct S3 object download using boto3 (no presigned URL decode).
     - Parallel downloads using ThreadPoolExecutor.
-    - Frame sampling to cap FPS (<=30) & total frames for requested duration.
+    - Fixed frame rate at 30 FPS.
     - Prefer FFmpeg H.264 (yuv420p + faststart) via imageio with optional scaling.
     """
     if not frame_keys:
@@ -1079,13 +1071,10 @@ def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_
     max_workers = int(os.getenv("TIMELAPSE_MAX_WORKERS", "16"))
 
     total = len(frame_keys)
-    target_fps = min(30, max(1, int(round(total / max(1, duration_sec)))))
-    target_frame_count = min(total, target_fps * duration_sec)
-    if target_frame_count < total:
-        indices = np.linspace(0, total - 1, target_frame_count, dtype=int)
-        frame_keys = [frame_keys[i] for i in indices]
-        total = len(frame_keys)
-        target_fps = max(1, min(30, int(round(total / max(1, duration_sec)))))
+    # Fixed FPS: 30 frames per second
+    target_fps = 30
+    # Use all frames, no sampling
+    target_frame_count = total
 
     def fetch_and_decode(idx_key_tuple):
         idx, key = idx_key_tuple
@@ -1319,7 +1308,8 @@ def generate():
                 os.chdir(cwd)
 
     # Timelapse mode
-    duration = int(request.form.get("duration", "10"))
+    # Fixed frame rate: 30 frames per second
+    duration = None  # Will be calculated based on frame count
     
     keys = list_frame_keys(camera, from_date, to_date)
     logging.info(f"Found {len(keys)} frames")
