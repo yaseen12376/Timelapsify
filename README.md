@@ -1,50 +1,93 @@
-# Timelapsify
+# Video Retrieval System
 
-A complete system to:
-- Capture RTSP snapshots every N minutes and upload to S3 under `Timelapse input/<camera>/<YYYY-MM-DD>/cameraX_YYYYMMDD_HHMMSS.jpg`.
-- Generate timelapse videos from date ranges in S3 via a Flask web app, upload to `Timelapse output/`, and return the S3 URL.
+A simple web application to retrieve and trim camera video clips from S3.
+
+## Features
+
+- 📥 **Video Retrieval**: Fetch videos from S3 using presigned URLs
+- ✂️ **Video Trimming**: Trim videos to specific time ranges (MM:SS format)
+- ☁️ **S3 Integration**: Automatically upload trimmed clips to S3
+- 🎬 **Video Playback**: Preview trimmed videos directly in the browser
+- 💾 **Download**: Download trimmed clips to your computer
 
 ## ✅ Setup Complete!
 
 Everything is already configured:
 - ✅ Python virtual environment created (`.venv`)
-- ✅ Dependencies installed (boto3, Flask, opencv-python, etc.)
+- ✅ Dependencies installed (boto3, Flask, ffmpeg, etc.)
 - ✅ Environment variables configured in `.env`
 - ✅ AWS S3 connection verified
-- ✅ All imports tested
 
 ## Quick Start
 
-### Option 1: Using PowerShell Scripts (Recommended)
+### Start the Web App
 
-**Start Frame Capture:**
-```powershell
-.\start_capture.ps1
-```
-This captures frames from all 3 cameras every 10 minutes and uploads to S3.
-
-**Start Web App:**
+**Using PowerShell Script (Recommended):**
 ```powershell
 .\start_webapp.ps1
 ```
-Then open `http://localhost:5000/` in your browser.
 
-### Option 2: Direct Python Commands
-
-**Start Frame Capture:**
-```powershell
-.\.venv\Scripts\python.exe src\capture_rtsp_to_s3.py
-```
-
-**Start Web App:**
+**Or run directly:**
 ```powershell
 .\.venv\Scripts\python.exe webapp\app.py
 ```
 
-Fill in from/to dates (YYYY-MM-DD), timelapse duration (seconds), and camera. The app gathers frames from `Timelapse input/<camera>/<date>/` across the range, builds an MP4, uploads to `Timelapse output/`, and returns an S3 URL in JSON.
+Then open `http://localhost:5000/` in your browser.
+
+## Usage
+
+1. **Get a Video URL**: Obtain a presigned URL for the video you want to trim from S3
+2. **Paste the URL**: Enter the presigned URL in the web interface
+3. **Set Time Range**: Specify the start and end times (e.g., 0:00 to 1:30)
+4. **Retrieve**: Click "Retrieve & Trim Video"
+5. **Preview & Download**: Watch the trimmed video in the browser or download it
+
+## How It Works
+
+1. User provides a presigned S3 video URL and time range
+2. Server uses ffmpeg to download and trim the video
+3. Trimmed video is uploaded to S3 under `ppe-detection-videos/history_trimmer/`
+4. New presigned URL is generated for the trimmed video
+5. User can preview or download the result
+
+## API Endpoint
+
+### POST `/retrieve`
+
+Retrieve and trim a video clip.
+
+**Request Body:**
+```json
+{
+  "currnturl": "https://s3-presigned-url.com/video.mp4?...",
+  "StartDateTime": "0:15",
+  "EndDateTime": "2:30",
+  "SelectedDuration": "2:15"
+}
+```
+
+**Response:**
+```json
+{
+  "StartDateTime": "0:15",
+  "EndDateTime": "2:30",
+  "SelectedDuration": "2:15",
+  "currnturl": "https://trimmed-video-presigned-url.com/...",
+  "download_url": "https://download-presigned-url.com/...",
+  "s3_key": "ppe-detection-videos/history_trimmer/camera1_clip_0-15_to_2-30_20260126_143022.mp4"
+}
+```
+
+## Requirements
+
+- Python 3.8+
+- ffmpeg (must be in PATH)
+- AWS S3 access credentials
+- Flask and dependencies (see requirements.txt)
 
 ## Notes
 
-- If your S3 objects are private, the app uses presigned URLs to read frames and will still work.
-- RTSP capture quality and latency depend on camera/NVR and network.
-- Adjust `CAPTURE_INTERVAL_MINUTES` to change snapshot cadence.
+- Trimmed videos are stored in S3 under `ppe-detection-videos/history_trimmer/`
+- Presigned URLs expire after 1 hour (3600 seconds)
+- Supports both MM:SS and HH:MM:SS time formats
+- ffmpeg must be installed and accessible in your system PATH

@@ -1,59 +1,37 @@
 import os
 import sys
 from datetime import datetime
-from io import BytesIO
 import logging
-import cv2
 import tempfile
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, render_template_string, jsonify, redirect, Response
+import re
+from flask import Flask, request, render_template_string, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import pytz
-import re
 
 # Add parent directory to path to import src module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 load_dotenv()
 
-from src.s3_utils import list_objects, upload_file, presigned_url, generate_s3_http_url, client
+from src.s3_utils import generate_s3_http_url, client
 
 import subprocess
-import traceback
 from boto3.s3.transfer import TransferConfig
-import urllib.request
-from urllib.error import HTTPError
-
 
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-INPUT_PREFIX = "Timelapse input"
-OUTPUT_PREFIX = "Timelapse output"
 HISTORY_TRIMMER_PREFIX = "ppe-detection-videos/history_trimmer"
 VIDEO_PREFIX = "ppe-detection-videos"
 TZ = pytz.timezone("Asia/Kolkata")
-SGT = pytz.timezone("Asia/Singapore")
 IST = pytz.timezone("Asia/Kolkata")
 
-
 CAMERAS = ["camera1", "camera2", "camera3"]
-
-# Preset time ranges for video playback
-PRESET_TIMES = [
-    {"label": "3:45 AM - 4:45 AM", "from": "03:45", "to": "04:45"},
-    {"label": "9:00 AM - 10:00 AM", "from": "09:00", "to": "10:00"},
-    {"label": "12:00 PM - 1:00 PM", "from": "12:00", "to": "13:00"},
-    {"label": "3:45 PM - 4:45 PM", "from": "15:45", "to": "16:45"},
-    {"label": "6:00 PM - 7:00 PM", "from": "18:00", "to": "19:00"},
-]
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 logging.basicConfig(level=logging.INFO)
-# Suppress noisy lower-level debug logs
 logging.getLogger('boto3').setLevel(logging.WARNING)
 logging.getLogger('botocore').setLevel(logging.WARNING)
 logging.getLogger('s3transfer').setLevel(logging.WARNING)
@@ -64,7 +42,7 @@ TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Timelapsify - Generate Timelapse Videos</title>
+    <title>Video Retrieval - Camera Video Clips</title>
     <style>
         * {
             margin: 0;
@@ -110,10 +88,9 @@ TEMPLATE = """
             margin-bottom: 8px;
             font-size: 14px;
         }
-        input[type="date"],
-        input[type="datetime-local"],
-        input[type="number"],
-        select {
+        input[type="url"],
+        input[type="text"],
+        input[type="datetime-local"] {
             width: 100%;
             padding: 12px 16px;
             border: 2px solid #e0e0e0;
@@ -122,35 +99,11 @@ TEMPLATE = """
             transition: all 0.3s;
             background: #fafafa;
         }
-        input[type="date"]:focus,
-        input[type="datetime-local"]:focus,
-        input[type="number"]:focus,
-        select:focus {
+        input:focus {
             outline: none;
             border-color: #667eea;
             background: white;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-        .quick-select {
-            display: flex;
-            gap: 10px;
-            margin-top: 10px;
-            flex-wrap: wrap;
-        }
-        .quick-btn {
-            padding: 8px 16px;
-            background: #f0f0f0;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 13px;
-            transition: all 0.2s;
-            color: #555;
-        }
-        .quick-btn:hover {
-            background: #667eea;
-            color: white;
-            border-color: #667eea;
         }
         button[type="submit"] {
             width: 100%;
@@ -217,20 +170,6 @@ TEMPLATE = """
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
-        .copy-btn {
-            padding: 8px 16px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 13px;
-            margin-right: 10px;
-            transition: background 0.2s;
-        }
-        .copy-btn:hover {
-            background: #5568d3;
-        }
         .download-btn {
             display: inline-block;
             padding: 12px 24px;
@@ -279,1278 +218,290 @@ TEMPLATE = """
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        .mode-toggle {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 25px;
-            background: #f0f0f0;
-            padding: 5px;
-            border-radius: 12px;
-            position: relative;
-        }
-        .mode-btn {
-            flex: 1;
-            padding: 10px;
-            text-align: center;
-            cursor: pointer;
-            border-radius: 10px;
-            z-index: 1;
-            transition: color 0.3s;
-            font-weight: 600;
-            color: #666;
-        }
-        .mode-btn.active {
-            color: #667eea;
-        }
-        .mode-indicator {
-            position: absolute;
-            top: 5px;
-            left: 5px;
-            width: calc(50% - 5px);
-            height: calc(100% - 10px);
-            background: white;
-            border-radius: 10px;
-            transition: transform 0.3s cubic-bezier(0.4, 0.0, 0.2, 1);
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }
-        .mode-toggle.retrieve .mode-indicator {
-            transform: translateX(100%);
-        }
-        .video-list {
-            margin-top: 20px;
-        }
-        .video-item {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 10px;
-            border: 1px solid #e0e0e0;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .video-info {
-            font-size: 14px;
-            color: #333;
-        }
-        .camera-grid {
+        .time-inputs {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: 1fr 1fr;
             gap: 10px;
-            margin-top: 10px;
-        }
-        .camera-option {
-            padding: 12px;
-            background: #f8f9fa;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            cursor: pointer;
-            text-align: center;
-            transition: all 0.2s;
-            font-weight: 500;
-        }
-        .camera-option:hover {
-            border-color: #667eea;
-            background: #f0f4ff;
-        }
-        .camera-option.selected {
-            background: #667eea;
-            color: white;
-            border-color: #667eea;
-        }
-        input[type="radio"] {
-            display: none;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎬 Timelapsify</h1>
-        <p class="subtitle">Generate stunning timelapse videos from your camera feeds</p>
+        <h1>🎬 Video Retrieval</h1>
+        <p class="subtitle">Retrieve and trim camera video clips</p>
         
-        <div class="mode-toggle" id="modeToggle">
-            <div class="mode-indicator"></div>
-            <div class="mode-btn active" onclick="setMode('timelapse')">Generate Timelapse</div>
-            <div class="mode-btn" onclick="setMode('retrieve')">Retrieve Videos</div>
-        </div>
-        
-        <form method="post" action="/generate" id="timelapseForm">
-            <input type="hidden" name="mode" id="modeInput" value="timelapse">
-            <div class="form-group" id="retrieveInputsGroup" style="display:none;">
+        <form method="post" action="/retrieve" id="retrieveForm">
+            <div class="form-group">
                 <label>🔗 Video URL (presigned)</label>
-                <input type="url" id="video_url" name="video_url" placeholder="https://...mp4?X-Amz-..." />
-                <div style="margin-top:12px; display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                <input type="url" id="video_url" name="video_url" placeholder="https://...mp4?X-Amz-..." required />
+                <p class="subtitle" style="margin-top:10px;">Paste the S3 presigned URL of the video you want to trim.</p>
+            </div>
+            
+            <div class="form-group">
+                <label>⏱️ Clip Time Range</label>
+                <div class="time-inputs">
                     <div>
-                        <label for="clip_start">🎞️ Clip Start (MM:SS)</label>
-                        <input type="text" id="clip_start" name="clip_start" placeholder="0:13" />
+                        <label for="clip_start">Start (MM:SS)</label>
+                        <input type="text" id="clip_start" name="clip_start" placeholder="0:13" value="0:00" required />
                     </div>
                     <div>
-                        <label for="clip_end">🏁 Clip End (MM:SS)</label>
-                        <input type="text" id="clip_end" name="clip_end" placeholder="1:45" />
+                        <label for="clip_end">End (MM:SS)</label>
+                        <input type="text" id="clip_end" name="clip_end" placeholder="1:45" value="1:00" required />
                     </div>
                 </div>
-                <p class="subtitle" style="margin-top:10px;">Enter start/end relative to the provided video.</p>
+                <p class="subtitle" style="margin-top:10px;">Enter start/end time relative to the video (Format: MM:SS or HH:MM:SS)</p>
             </div>
             
-            <div class="form-group" id="dateRangeGroup">
-                <label>📅 Date Range</label>
-                <div class="quick-select">
-                    <button type="button" class="quick-btn" onclick="setRange('today')">Today</button>
-                    <button type="button" class="quick-btn" onclick="setRange('yesterday')">Yesterday</button>
-                    <button type="button" class="quick-btn" onclick="setRange('last7days')">Last 7 Days</button>
-                    <button type="button" class="quick-btn" onclick="setRange('last30days')">Last 30 Days</button>
-                    <button type="button" class="quick-btn" onclick="setRange('thisweek')">This Week</button>
-                    <button type="button" class="quick-btn" onclick="setRange('lastmonth')">Last Month</button>
-                </div>
-            </div>
-            
-            <div class="form-group" id="fromDateGroup">
-                <label for="from_date">From Date & Time</label>
-                <input type="datetime-local" id="from_date" name="from_date" required>
-            </div>
-            
-            <div class="form-group" id="toDateGroup">
-                <label for="to_date">To Date & Time</label>
-                <input type="datetime-local" id="to_date" name="to_date" required>
-            </div>
-            
-            <div class="form-group" id="cameraGroup">
-                <label>📷 Select Camera</label>
-                <div class="camera-grid">
-                    {% for cam in cameras %}
-                    <label class="camera-option" onclick="selectCamera(this, '{{cam}}')">
-                        <input type="radio" name="camera" value="{{cam}}" {% if loop.first %}checked{% endif %}>
-                        {{cam}}
-                    </label>
-                    {% endfor %}
-                </div>
-            </div>
-            
-            <button type="submit">🎥 Generate Timelapse</button>
+            <button type="submit">🔍 Retrieve & Trim Video</button>
         </form>
         
         <div class="loading" id="loading">
             <div class="spinner"></div>
-            <p>Generating your timelapse... This may take a few moments.</p>
+            <p>Processing your video... This may take a few moments.</p>
         </div>
         
-        <div class="result" id="result">
-            <h3>✅ Timelapse Generated Successfully!</h3>
-            
-            <a id="downloadBtn" href="#" class="download-btn" download style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
-            
-            <div class="url-label">S3 URI</div>
-            <div class="url-box" id="s3Uri"></div>
-            <div class="url-label">Download URL</div>
-            <div class="url-box" id="httpUrl"></div>
-            <div style="margin-top: 10px;">
-                <button class="copy-btn" onclick="copyUrl('s3')">Copy S3 URI</button>
-                <button class="copy-btn" onclick="copyUrl('http')">Copy URL</button>
-            </div>
-        </div>
-        
+        <div class="result" id="result"></div>
         <div class="error" id="error"></div>
     </div>
     
     <script>
-        let currentMode = 'timelapse';
-
-        function setMode(mode) {
-            currentMode = mode;
-            document.getElementById('modeInput').value = mode;
-            const toggle = document.getElementById('modeToggle');
-            const retrieveInputsGroup = document.getElementById('retrieveInputsGroup');
-            const dateRangeGroup = document.getElementById('dateRangeGroup');
-            const fromDateGroup = document.getElementById('fromDateGroup');
-            const toDateGroup = document.getElementById('toDateGroup');
-            const cameraGroup = document.getElementById('cameraGroup');
-            const submitBtn = document.querySelector('button[type="submit"]');
-            const btns = document.querySelectorAll('.mode-btn');
-            
-            if (mode === 'retrieve') {
-                toggle.classList.add('retrieve');
-                retrieveInputsGroup.style.display = 'block';
-                dateRangeGroup.style.display = 'none';
-                fromDateGroup.style.display = 'none';
-                toDateGroup.style.display = 'none';
-                cameraGroup.style.display = 'none';
-                submitBtn.textContent = '🔍 Find Videos';
-                btns[0].classList.remove('active');
-                btns[1].classList.add('active');
-            } else {
-                toggle.classList.remove('retrieve');
-                retrieveInputsGroup.style.display = 'none';
-                dateRangeGroup.style.display = 'block';
-                fromDateGroup.style.display = 'block';
-                toDateGroup.style.display = 'block';
-                cameraGroup.style.display = 'block';
-                submitBtn.textContent = '🎥 Generate Timelapse';
-                btns[0].classList.add('active');
-                btns[1].classList.remove('active');
-            }
-        }
-        
-        function setPresetTime(fromTime, toTime) {
-            const today = new Date();
-            const year = today.getFullYear();
-            const month = String(today.getMonth() + 1).padStart(2, '0');
-            const day = String(today.getDate()).padStart(2, '0');
-            
-            document.getElementById('from_date').value = `${year}-${month}-${day}T${fromTime}`;
-            document.getElementById('to_date').value = `${year}-${month}-${day}T${toTime}`;
-        }
-
-        // Set camera1 as selected by default
-        document.addEventListener('DOMContentLoaded', function() {
-            const firstCamera = document.querySelector('.camera-option');
-            if (firstCamera) {
-                firstCamera.classList.add('selected');
-            }
-            // Set today as default dates for timelapse mode
-            setRange('today');
-            // Set default retrieve input values
-            const clipStart = document.getElementById('clip_start');
-            const clipEnd = document.getElementById('clip_end');
-            if (clipStart && clipEnd) {
-                clipStart.value = '0:00';
-                clipEnd.value = '1:00';
-            }
-        });
-        
-        function selectCamera(element, camera) {
-            document.querySelectorAll('.camera-option').forEach(opt => {
-                opt.classList.remove('selected');
-            });
-            element.classList.add('selected');
-            element.querySelector('input').checked = true;
-        }
-        
-        function setRange(range) {
-            const today = new Date();
-            let fromDate = new Date();
-            let toDate = new Date();
-            
-            switch(range) {
-                case 'today':
-                    fromDate = toDate = today;
-                    break;
-                case 'yesterday':
-                    fromDate = toDate = new Date(today.setDate(today.getDate() - 1));
-                    break;
-                case 'last7days':
-                    fromDate = new Date(today.setDate(today.getDate() - 6));
-                    toDate = new Date();
-                    break;
-                case 'last30days':
-                    fromDate = new Date(today.setDate(today.getDate() - 29));
-                    toDate = new Date();
-                    break;
-                case 'thisweek':
-                    const dayOfWeek = today.getDay();
-                    fromDate = new Date(today.setDate(today.getDate() - dayOfWeek));
-                    toDate = new Date();
-                    break;
-                case 'lastmonth':
-                    fromDate = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-                    toDate = new Date(today.getFullYear(), today.getMonth(), 0);
-                    break;
-            }
-            
-            document.getElementById('from_date').value = formatDate(fromDate);
-            document.getElementById('to_date').value = formatDate(toDate);
-        }
-        
-        function formatDate(date) {
-            const year = date.getFullYear();
-            const month = String(date.getMonth() + 1).padStart(2, '0');
-            const day = String(date.getDate()).padStart(2, '0');
-            const hours = String(date.getHours()).padStart(2, '0');
-            const minutes = String(date.getMinutes()).padStart(2, '0');
-            return `${year}-${month}-${day}T${hours}:${minutes}`;
-        }
-        
-        document.getElementById('timelapseForm').addEventListener('submit', async function(e) {
+        document.getElementById('retrieveForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
             document.getElementById('result').classList.remove('show');
             document.getElementById('error').classList.remove('show');
             document.getElementById('loading').style.display = 'block';
             
-            const formData = new FormData(this);
+            const urlVal = document.getElementById('video_url').value;
+            const startClip = document.getElementById('clip_start').value.trim();
+            const endClip = document.getElementById('clip_end').value.trim();
+            
+            function parseToSeconds(txt) {
+                const parts = txt.split(':').map(p => p.trim());
+                if (parts.length === 2) {
+                    const mm = parseInt(parts[0], 10);
+                    const ss = parseInt(parts[1], 10);
+                    return (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
+                } else if (parts.length === 3) {
+                    const hh = parseInt(parts[0], 10);
+                    const mm = parseInt(parts[1], 10);
+                    const ss = parseInt(parts[2], 10);
+                    return (isNaN(hh)?0:hh) * 3600 + (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
+                }
+                return 0;
+            }
+            
+            const startSec = parseToSeconds(startClip);
+            const endSec = parseToSeconds(endClip);
+            const selSec = Math.max(0, endSec - startSec);
+            const mm = Math.floor(selSec / 60);
+            const ss = String(selSec % 60).padStart(2, '0');
+            
+            const payload = {
+                StartDateTime: startClip,
+                EndDateTime: endClip,
+                SelectedDuration: `${mm}:${ss}`,
+                currnturl: urlVal
+            };
             
             try {
-                let response, data;
-                if (currentMode === 'retrieve') {
-                    // Build new JSON payload for /retrieve-history (trim by URL)
-                    const urlVal = document.getElementById('video_url').value;
-                    const startClip = document.getElementById('clip_start').value.trim();
-                    const endClip = document.getElementById('clip_end').value.trim();
-                    function parseToSeconds(txt) {
-                        const parts = txt.split(':').map(p => p.trim());
-                        if (parts.length === 2) {
-                            const mm = parseInt(parts[0], 10);
-                            const ss = parseInt(parts[1], 10);
-                            return (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
-                        } else if (parts.length === 3) {
-                            const hh = parseInt(parts[0], 10);
-                            const mm = parseInt(parts[1], 10);
-                            const ss = parseInt(parts[2], 10);
-                            return (isNaN(hh)?0:hh) * 3600 + (isNaN(mm)?0:mm) * 60 + (isNaN(ss)?0:ss);
-                        }
-                        return 0;
-                    }
-                    const startSec = parseToSeconds(startClip);
-                    const endSec = parseToSeconds(endClip);
-                    const selSec = Math.max(0, endSec - startSec);
-                    const mm = Math.floor(selSec / 60);
-                    const ss = String(selSec % 60).padStart(2, '0');
-                    const payload = {
-                        StartDateTime: startClip,
-                        EndDateTime: endClip,
-                        SelectedDuration: `${mm}:${ss}`,
-                        currnturl: urlVal
-                    };
-                    response = await fetch('/retrieve-history', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    data = await response.json();
-                    document.getElementById('loading').style.display = 'none';
-                    if (response.ok) {
-                        let html = `
-                            <h3>✅ Clip Retrieved</h3>
-                            <div style="margin-bottom: 20px;">
-                                <video width="100%" controls autoplay>
-                                    <source src="${data.currnturl}" type="video/mp4">
-                                    Your browser does not support the video tag.
-                                </video>
-                            </div>
-                            <div class="url-label">Current URL</div>
-                            <div class="url-box" id="httpUrl">${data.currnturl}</div>
-                            <div class="url-label">Window</div>
-                            <div class="url-box">${data.StartDateTime} → ${data.EndDateTime}</div>
-                            <div class="url-label">Selected Duration</div>
-                            <div class="url-box">${data.SelectedDuration}</div>
-                            <a id="downloadBtn" href="${data.download_url}" class="download-btn" download style="display:block; text-align:center; margin-top:10px;">📥 Download Trimmed Clip</a>
-                        `;
-                        document.getElementById('result').innerHTML = html;
-                        document.getElementById('result').classList.add('show');
-                    } else {
-                        document.getElementById('error').textContent = data.error || 'Failed to retrieve clip';
-                        document.getElementById('error').classList.add('show');
-                    }
+                const response = await fetch('/retrieve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const data = await response.json();
+                document.getElementById('loading').style.display = 'none';
+                
+                if (response.ok) {
+                    let html = `
+                        <h3>✅ Video Clip Retrieved</h3>
+                        <div style="margin-bottom: 20px;">
+                            <video width="100%" controls autoplay>
+                                <source src="${data.currnturl}" type="video/mp4">
+                                Your browser does not support the video tag.
+                            </video>
+                        </div>
+                        <div class="url-label">Trimmed Video URL</div>
+                        <div class="url-box">${data.currnturl}</div>
+                        <div class="url-label">Time Range</div>
+                        <div class="url-box">${data.StartDateTime} → ${data.EndDateTime}</div>
+                        <div class="url-label">Duration</div>
+                        <div class="url-box">${data.SelectedDuration}</div>
+                        <a href="${data.download_url}" class="download-btn" download style="display:block; text-align:center; margin-top:10px;">📥 Download Trimmed Clip</a>
+                    `;
+                    document.getElementById('result').innerHTML = html;
+                    document.getElementById('result').classList.add('show');
                 } else {
-                    const responseGen = await fetch('/generate', { method: 'POST', body: formData });
-                    const dataGen = await responseGen.json();
-                    document.getElementById('loading').style.display = 'none';
-                    if (responseGen.ok) {
-                        const resultHtml = `
-                            <h3>✅ Timelapse Generated Successfully!</h3>
-                            
-                            <a id="downloadBtn" href="${dataGen.download_url}" class="download-btn" download="${dataGen.filename}" style="display:block; text-align:center; margin-bottom:20px;">📥 Download Video to Computer</a>
-                            
-                            <div class="url-label">S3 URI</div>
-                            <div class="url-box" id="s3Uri">${dataGen.s3_uri}</div>
-                            <div class="url-label">Download URL</div>
-                            <div class="url-box" id="httpUrl">${dataGen.url}</div>
-                            <div style="margin-top: 10px;">
-                                <button class="copy-btn" onclick="copyUrl('s3')">Copy S3 URI</button>
-                                <button class="copy-btn" onclick="copyUrl('http')">Copy URL</button>
-                            </div>
-                        `;
-                        document.getElementById('result').innerHTML = resultHtml;
-                        document.getElementById('result').classList.add('show');
-                    } else {
-                        document.getElementById('error').textContent = dataGen.error || 'An error occurred';
-                        document.getElementById('error').classList.add('show');
-                    }
+                    document.getElementById('error').textContent = data.error || 'Failed to retrieve clip';
+                    document.getElementById('error').classList.add('show');
                 }
             } catch (error) {
                 document.getElementById('loading').style.display = 'none';
-                document.getElementById('error').textContent = 'Failed to generate timelapse: ' + error.message;
+                document.getElementById('error').textContent = 'Failed to process video: ' + error.message;
                 document.getElementById('error').classList.add('show');
             }
         });
-        
-        function copyUrl(type) {
-            const text = type === 's3' 
-                ? document.getElementById('s3Uri').textContent
-                : document.getElementById('httpUrl').textContent;
-            
-            navigator.clipboard.writeText(text).then(() => {
-                const btn = event.target;
-                const originalText = btn.textContent;
-                btn.textContent = '✓ Copied!';
-                setTimeout(() => {
-                    btn.textContent = originalText;
-                }, 2000);
-            });
-        }
     </script>
 </body>
 </html>
 """
 
 
-def list_frame_keys(camera: str, from_datetime: str, to_datetime: str) -> list[str]:
-    # List keys with datetime filtering
-    # Accepts: YYYY-MM-DD or YYYY-MM-DDTHH:MM format
-    try:
-        # Try parsing with time
-        if 'T' in from_datetime:
-            start = datetime.strptime(from_datetime, "%Y-%m-%dT%H:%M")
-            end = datetime.strptime(to_datetime, "%Y-%m-%dT%H:%M")
-        else:
-            # Fallback to date only
-            start = datetime.strptime(from_datetime, "%Y-%m-%d")
-            end = datetime.strptime(to_datetime, "%Y-%m-%d")
-    except ValueError:
-        return []
-    
-    if end < start:
-        return []
-    
-    # Collect all frames from date range
-    days = (end.date() - start.date()).days
-    all_keys = []
-    for i in range(days + 1):
-        d = (start.date() + timedelta(days=i)).strftime("%Y-%m-%d")
-        prefix = f"{INPUT_PREFIX}/{camera}/{d}/"
-        objs = list_objects(prefix)
-        day_keys = [o["Key"] for o in objs]
-        all_keys.extend(day_keys)
-    
-    # Filter by time if specified
-    if 'T' in from_datetime:
-        logging.info(f"Time filtering with India TZ input: {start} to {end}")
-        logging.info(f"Total frames before filtering: {len(all_keys)}")
-        
-        # User inputs time in India timezone (Asia/Kolkata UTC+5:30)
-        # S3 frames were captured with Singapore timezone (Asia/Singapore UTC+8)
-        # We need to convert India time to Singapore time to match filenames
-        
-        india_tz = pytz.timezone("Asia/Kolkata")
-        singapore_tz = pytz.timezone("Asia/Singapore")
-        
-        # Make user input timezone-aware (India)
-        start_india = india_tz.localize(start)
-        end_india = india_tz.localize(end)
-        
-        # Convert to Singapore timezone (what's in S3 filenames)
-        start_singapore = start_india.astimezone(singapore_tz)
-        end_singapore = end_india.astimezone(singapore_tz)
-        
-        logging.info(f"Converted to Singapore TZ (S3 filenames): {start_singapore.strftime('%Y-%m-%d %H:%M:%S')} to {end_singapore.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        filtered_keys = []
-        for key in all_keys:
-            # Extract timestamp from key: camera1_20251126_153000.jpg
-            try:
-                parts = key.split('/')[-1].split('_')
-                if len(parts) >= 3:
-                    date_str = parts[1]
-                    time_str = parts[2].split('.')[0]
-                    # Parse as naive datetime
-                    frame_dt_naive = datetime.strptime(f"{date_str}{time_str}", "%Y%m%d%H%M%S")
-                    
-                    # S3 filenames are in Singapore timezone
-                    frame_dt_singapore = singapore_tz.localize(frame_dt_naive)
-                    
-                    # Compare in Singapore timezone
-                    if start_singapore <= frame_dt_singapore <= end_singapore:
-                        filtered_keys.append(key)
-            except Exception as e:
-                logging.warning(f"Failed to parse key {key}: {e}")
-                continue
-        logging.info(f"Frames after time filtering: {len(filtered_keys)}")
-        return sorted(filtered_keys)
-    
-    return sorted(all_keys)
-
-
-def list_video_keys(camera: str, from_datetime: str, to_datetime: str) -> list[dict]:
-    # List existing video files in ppe-detection-videos/{camera}/
-    # Filename format: XVR_ch1_main_YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
-    # S3 filenames are in IST (UTC+5:30). Input is also in IST.
-    
-    try:
-        if 'T' in from_datetime:
-            start_naive = datetime.strptime(from_datetime, "%Y-%m-%dT%H:%M")
-            end_naive = datetime.strptime(to_datetime, "%Y-%m-%dT%H:%M")
-        else:
-            start_naive = datetime.strptime(from_datetime, "%Y-%m-%d")
-            end_naive = datetime.strptime(to_datetime, "%Y-%m-%d")
-            
-        # Both input and video filenames are in IST
-        start_ist = IST.localize(start_naive)
-        end_ist = IST.localize(end_naive)
-        
-        logging.info(f"Searching IST range: {start_ist} to {end_ist}")
-        
-    except ValueError:
-        return []
-        
-    prefix = f"{VIDEO_PREFIX}/{camera}/"
-    objs = list_objects(prefix)
-    
-    found_videos = []
-    import re
-    # Regex for new format: ..._YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4
-    new_format_re = re.compile(r'(\d{14})_(\d{14})\.mp4$')
-    
-    for obj in objs:
-        key = obj["Key"]
-        filename = key.split('/')[-1]
-        if not filename.endswith('.mp4'):
-            continue
-            
-        video_start_ist = None
-        video_end_ist = None
-        
-        # Try new format first
-        match = new_format_re.search(filename)
-        if match:
-            try:
-                start_str = match.group(1)
-                end_str = match.group(2)
-                video_start_ist = IST.localize(datetime.strptime(start_str, "%Y%m%d%H%M%S"))
-                video_end_ist = IST.localize(datetime.strptime(end_str, "%Y%m%d%H%M%S"))
-                logging.debug(f"Parsed {filename}: {video_start_ist} to {video_end_ist}")
-            except ValueError as e:
-                logging.debug(f"Failed to parse new format for {filename}: {e}")
-                pass
-        
-        # Fallback to old format
-        if not video_start_ist:
-            try:
-                name_part = filename[:-4]
-                if len(name_part) >= 19 and re.match(r'\d{4}_\d{2}_\d{2}_\d{2}-\d{2}-\d{2}$', name_part):
-                    dt = datetime.strptime(name_part, "%Y_%m_%d_%H-%M-%S")
-                    video_start_ist = IST.localize(dt)
-                    # Assume 1 hour duration if unknown
-                    video_end_ist = video_start_ist + timedelta(hours=1)
-            except ValueError:
-                pass
-                
-        if video_start_ist and video_end_ist:
-            # Check for overlap
-            if max(start_ist, video_start_ist) < min(end_ist, video_end_ist):
-                found_videos.append({
-                    "key": key,
-                    "filename": filename,
-                    "start_ist": video_start_ist,
-                    "end_ist": video_end_ist,
-                    "size": obj["Size"]
-                })
-        else:
-            logging.debug(f"Video {filename} does not overlap with requested range")
-            
-    logging.info(f"Found {len(found_videos)} matching videos out of {len(objs)} total")
-    return sorted(found_videos, key=lambda x: x['start_ist'])
-
-
-def _supports_http_range(url: str) -> bool:
-    try:
-        req = urllib.request.Request(url, headers={"Range": "bytes=0-1"})
-        with urllib.request.urlopen(req) as resp:
-            # 206 Partial Content indicates range support
-            return resp.status == 206 or resp.getheader("Content-Range") is not None
-    except HTTPError as e:
-        # Some servers respond 206; if 200 without Content-Range, ranges unsupported
-        if e.code == 206:
-            return True
-        return False
-    except Exception:
-        return False
-
 def _parse_clip_time_to_seconds(txt: str) -> int:
-    """Parse 'MM:SS' or 'HH:MM:SS' to total seconds. Returns 0 on error."""
-    try:
-        txt = txt.strip()
-        parts = txt.split(":")
-        if len(parts) == 2:
-            mm = int(parts[0])
-            ss = int(parts[1])
-            return mm * 60 + ss
-        elif len(parts) == 3:
-            hh = int(parts[0])
-            mm = int(parts[1])
-            ss = int(parts[2])
-            return hh * 3600 + mm * 60 + ss
-        else:
-            return 0
-    except Exception:
-        return 0
+    """Parse MM:SS or HH:MM:SS to seconds"""
+    parts = txt.split(':')
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    elif len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    return 0
+
 
 def _format_seconds_mmss(total_sec: int) -> str:
-    total_sec = max(0, int(total_sec))
+    """Format seconds as MM:SS"""
     return f"{total_sec // 60}:{str(total_sec % 60).zfill(2)}"
 
-def _extract_total_duration_from_url(url: str) -> str | None:
-    """Try to compute total duration from filename pattern _YYYYMMDDHHMMSS_YYYYMMDDHHMMSS.mp4 in URL."""
-    try:
-        m = re.search(r"(\d{14})_(\d{14})\.mp4", url)
-        if not m:
-            return None
-        start_str, end_str = m.group(1), m.group(2)
-        start_dt = datetime.strptime(start_str, "%Y%m%d%H%M%S")
-        end_dt = datetime.strptime(end_str, "%Y%m%d%H%M%S")
-        return _format_seconds_mmss(int((end_dt - start_dt).total_seconds()))
-    except Exception:
-        return None
 
 def trim_video_by_url(presigned_url: str, start_offset_sec: int, end_offset_sec: int, output_path: str) -> bool:
-    """Trim a single S3 video by presigned URL using HTTP range stream copy."""
+    """
+    Trim video by fetching from presigned URL using ffmpeg
+    """
     try:
-        duration = max(0, end_offset_sec - start_offset_sec)
-        if duration <= 0:
-            logging.error("Invalid trim window: non-positive duration")
-            return False
-        # Use accurate seek with re-encoding to avoid keyframe rounding issues
+        duration_sec = end_offset_sec - start_offset_sec
+        
+        # Use ffmpeg to download and trim the video from presigned URL
         cmd = [
-            "ffmpeg", "-y",
-            "-rw_timeout", "30000000",
-            "-i", presigned_url,
+            "ffmpeg",
             "-ss", str(start_offset_sec),
-            "-t", str(duration),
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
+            "-i", presigned_url,
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-y",
             output_path
         ]
-        logging.info(f"Trimming via URL (re-encode): start={start_offset_sec}s, duration={duration}s")
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        logging.info(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
         if result.returncode != 0:
-            logging.error("ffmpeg trim failed for URL input")
-            logging.error(result.stderr.decode(errors='ignore'))
-            return False
-        return True
-    except Exception as e:
-        logging.error(f"URL trim failed: {e}")
-        return False
-
-def process_videos(videos: list[dict], start_ist_str: str, end_ist_str: str, output_path: str) -> bool:
-    """
-    Downloads, trims, and merges videos to match the requested IST range.
-    """
-    logging.info(f"process_videos called with {len(videos)} videos, start={start_ist_str}, end={end_ist_str}, output={output_path}")
-    try:
-        # Parse IST range again for processing
-        start_ist = IST.localize(datetime.strptime(start_ist_str.replace('T', ' '), "%Y-%m-%d %H:%M"))
-        end_ist = IST.localize(datetime.strptime(end_ist_str.replace('T', ' '), "%Y-%m-%d %H:%M"))
-        
-        # Both request and video timestamps are in IST - no conversion needed
-        temp_files = []
-        
-        # Prepare presigned URLs and verify HTTP range support
-        prepared = []
-        logging.info("Preparing presigned URLs and verifying HTTP range support for streaming trims...")
-        for i, v in enumerate(videos):
-            presigned = client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': S3_BUCKET_NAME, 'Key': v['key']},
-                ExpiresIn=3600
-            )
-            if not _supports_http_range(presigned):
-                logging.error(f"Range streaming unsupported for {v['key']}. This server/object requires full download.")
-                raise RuntimeError("HTTP Range not supported: falling back would require full download, aborting per request.")
-            prepared.append((i, presigned, v))
-
-        # Sort by index to maintain order
-        prepared.sort(key=lambda x: x[0])
-
-        for i, presigned_url, v in prepared:
-            
-            # Calculate trim points (all in IST)
-            vid_start = v['start_ist']
-            vid_end = v['end_ist']
-            
-            # Intersection of request and video
-            trim_start = max(start_ist, vid_start)
-            trim_end = min(end_ist, vid_end)
-            
-            # Calculate offsets in seconds
-            start_offset = (trim_start - vid_start).total_seconds()
-            duration = (trim_end - trim_start).total_seconds()
-            
-            if duration <= 0:
-                continue
-                
-            # Trim using stream copy (no re-encoding) for maximum speed
-            trimmed_filename = f"trim_{i}.mp4"
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(start_offset),
-                "-t", str(duration),
-                "-rw_timeout", "30000000",  # 30s read timeout
-                "-i", presigned_url,
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                trimmed_filename
-            ]
-            logging.info(f"Streaming trim via HTTP ranges for clip {i}: start={start_offset}s, duration={duration}s")
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if result.returncode != 0:
-                logging.error(f"ffmpeg trim failed for clip {i}. The input may not support range seeks or moov-at-end.")
-                logging.error(result.stderr.decode(errors='ignore'))
-                raise RuntimeError("ffmpeg range trim failed: input not seekable or server rejected range requests.")
-            
-            temp_files.append(trimmed_filename)
-            
-        if not temp_files:
+            logging.error(f"FFmpeg error: {result.stderr}")
             return False
             
-        # Merge if multiple
-        if len(temp_files) > 1:
-            with open("list.txt", "w") as f:
-                for tf in temp_files:
-                    f.write(f"file '{tf}'\n")
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logging.error(f"Output file not created or empty: {output_path}")
+            return False
             
-            # Try stream copy first (fastest), fallback to re-encoding if needed
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", "list.txt",
-                "-c", "copy",  # Stream copy for maximum speed
-                output_path
-            ]
-            logging.info("Merging videos with stream copy...")
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            
-            # If stream copy fails, fallback to fast re-encoding
-            if result.returncode != 0:
-                logging.warning("Stream copy failed, re-encoding...")
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", "list.txt",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",  # Faster than ultrafast with better compression
-                    "-crf", "23",  # Better quality, reasonable speed
-                    "-c:a", "aac",
-                    "-b:a", "128k",
-                    output_path
-                ]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # Cleanup
-            for tf in temp_files:
-                os.remove(tf)
-            os.remove("list.txt")
-        else:
-            # Just rename the single file
-            os.rename(temp_files[0], output_path)
-            
-        logging.info("All trims completed using streaming HTTP ranges; proceeding to merge.")
+        logging.info(f"Successfully trimmed video: {output_path}")
         return True
         
     except Exception as e:
-        logging.error(f"Processing failed: {e}")
-        logging.error(traceback.format_exc())
+        logging.error(f"Error trimming video: {e}")
         return False
-
-
-
-def build_timelapse_from_keys(frame_keys: list[str], output_path: str, duration_sec: int) -> tuple[bool, str | None, str | None]:
-    """Efficient timelapse builder.
-    Optimizations:
-    - Direct S3 object download using boto3 (no presigned URL decode).
-    - Parallel downloads using ThreadPoolExecutor.
-    - Fixed frame rate at 30 FPS.
-    - Prefer FFmpeg H.264 (yuv420p + faststart) via imageio with optional scaling.
-    """
-    if not frame_keys:
-        return (False, None, None)
-
-    max_workers = int(os.getenv("TIMELAPSE_MAX_WORKERS", "16"))
-
-    total = len(frame_keys)
-    # Fixed FPS: 30 frames per second
-    target_fps = 30
-    # Use all frames, no sampling
-    target_frame_count = total
-
-    def fetch_and_decode(idx_key_tuple):
-        idx, key = idx_key_tuple
-        try:
-            obj = client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
-            data = obj['Body'].read()
-            arr = np.frombuffer(data, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if idx < 3:
-                logging.info(f"Downloaded frame {idx}: {key}")
-            return idx, frame
-        except Exception as e:
-            logging.error(f"Failed to fetch frame {idx} ({key}): {e}")
-            return idx, None
-
-    frames_dict = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(fetch_and_decode, (i, k)) for i, k in enumerate(frame_keys)]
-        for future in as_completed(futures):
-            idx, frame = future.result()
-            if frame is not None:
-                frames_dict[idx] = frame
-
-    if not frames_dict:
-        return (False, None, None)
-
-    ordered_indices = sorted(frames_dict.keys())
-    if not ordered_indices:
-        return (False, None, None)
-
-    first_img = frames_dict[ordered_indices[0]]
-    h, w = first_img.shape[:2]
-
-    # Determine target resolution (optional upscaling)
-    target_w, target_h = w, h
-    try:
-        target_w_env = os.getenv("TIMELAPSE_TARGET_WIDTH")
-        target_h_env = os.getenv("TIMELAPSE_TARGET_HEIGHT")
-        min_w_env = os.getenv("TIMELAPSE_MIN_WIDTH")
-        min_h_env = os.getenv("TIMELAPSE_MIN_HEIGHT")
-
-        if target_w_env and target_h_env:
-            tw = int(target_w_env)
-            th = int(target_h_env)
-            if tw > 0 and th > 0:
-                target_w, target_h = tw, th
-        else:
-            scale = 1.0
-            if min_w_env:
-                mw = int(min_w_env)
-                if mw > 0:
-                    scale = max(scale, mw / w)
-            if min_h_env:
-                mh = int(min_h_env)
-                if mh > 0:
-                    scale = max(scale, mh / h)
-            if scale > 1.0:
-                target_w = int(round(w * scale))
-                target_h = int(round(h * scale))
-        # Ensure even dimensions for H.264 compatibility
-        if target_w % 2 != 0:
-            target_w += 1
-        if target_h % 2 != 0:
-            target_h += 1
-    except Exception as e:
-        logging.warning(f"Resolution selection error, using source size {w}x{h}: {e}")
-        target_w, target_h = w, h
-
-    base, _ext = os.path.splitext(output_path)
-    # Preferred: H.264 via imageio-ffmpeg
-    try:
-        import imageio
-        crf = os.getenv("TIMELAPSE_CRF", "20")
-        preset = os.getenv("TIMELAPSE_PRESET", "veryfast")
-        mp4_path = base + ".mp4"
-        logging.info(f"Attempting FFmpeg H.264 encode with CRF={crf}, preset={preset}, size={target_w}x{target_h}")
-        writer = imageio.get_writer(
-            mp4_path,
-            format="ffmpeg",
-            fps=target_fps,
-            codec="libx264",
-            ffmpeg_params=[
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-crf", str(crf),
-                "-preset", preset,
-                "-profile:v", "high", "-level", "4.2",
-            ],
-        )
-        for idx in ordered_indices:
-            frame = frames_dict[idx]
-            if frame.shape[1] != target_w or frame.shape[0] != target_h:
-                interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
-                frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            writer.append_data(frame_rgb)
-        writer.close()
-        logging.info(f"Encoded with FFmpeg H.264 -> {mp4_path} at {target_w}x{target_h}")
-        return (True, mp4_path, "video/mp4")
-    except Exception as e:
-        logging.warning(f"FFmpeg H.264 path not available, falling back to OpenCV encoders: {e}")
-
-    # Fallback: OpenCV codecs
-    codec_options = [
-        ("avc1", ".mp4", "video/mp4"),
-        ("H264", ".mp4", "video/mp4"),
-        ("mp4v", ".mp4", "video/mp4"),
-        ("XVID", ".avi", "video/x-msvideo"),
-        ("MJPG", ".avi", "video/x-msvideo"),
-    ]
-
-    writer = None
-    actual_path = None
-    actual_mime = None
-
-    for fourcc_str, ext, mime in codec_options:
-        candidate_path = base + ext
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        out = cv2.VideoWriter(candidate_path, fourcc, target_fps, (target_w, target_h))
-        if out.isOpened():
-            logging.info(f"Using codec {fourcc_str} -> {candidate_path}")
-            writer = out
-            actual_path = candidate_path
-            actual_mime = mime
-            break
-        else:
-            out.release()
-            logging.warning(f"Failed to open VideoWriter with codec {fourcc_str} for {candidate_path}")
-
-    if writer is None:
-        logging.error("No available video encoder found. Timelapse build aborted.")
-        return (False, None, None)
-
-    logging.info(f"Writing {len(ordered_indices)} frames to video (FPS: {target_fps}, size: {target_w}x{target_h})")
-    for i, idx in enumerate(ordered_indices):
-        frame = frames_dict[idx]
-        if frame.shape[1] != target_w or frame.shape[0] != target_h:
-            interp = cv2.INTER_LANCZOS4 if (target_w >= w and target_h >= h) else cv2.INTER_AREA
-            frame = cv2.resize(frame, (target_w, target_h), interpolation=interp)
-        writer.write(frame)
-        if i < 3 or i >= len(ordered_indices) - 3:
-            key = frame_keys[idx]
-            logging.info(f"Frame {i}: index={idx}, key={key.split('/')[-1]}")
-
-    writer.release()
-    return (True, actual_path, actual_mime)
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(TEMPLATE, cameras=CAMERAS, preset_times=PRESET_TIMES)
+    return render_template_string(TEMPLATE)
 
 
-from datetime import timedelta
-
-@app.route("/generate", methods=["POST"])
-def generate():
-    mode = request.form.get("mode", "timelapse")
-    from_date = request.form.get("from_date")
-    to_date = request.form.get("to_date")
-    camera = request.form.get("camera")
-    
-    logging.info(f"Request: mode={mode}, camera={camera}, from={from_date}, to={to_date}")
-    
-    if camera not in CAMERAS:
-        return jsonify({"error": "Invalid camera"}), 400
-
-    if mode == "retrieve":
-        videos = list_video_keys(camera, from_date, to_date)
-        if not videos:
-            return jsonify({"error": "No videos found in range"}), 200
-            
-        # Process videos (Trim & Merge)
-        ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-        from_clean = from_date.replace('T', '_').replace(':', '')
-        to_clean = to_date.replace('T', '_').replace(':', '')
-        base_name = f"{camera}_retrieved_{from_clean}_to_{to_clean}_{ts}.mp4"
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # We need to work in current dir for ffmpeg to find files easily or handle paths carefully
-            # For simplicity, we'll change cwd to tmpdir
-            cwd = os.getcwd()
-            os.chdir(tmpdir)
-            try:
-                if process_videos(videos, from_date, to_date, base_name):
-                    # Upload result to history_trimmer folder with optimized config
-                    s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
-                    logging.info(f"Uploading result to {s3_key}...")
-                    
-                    # Optimized transfer config for faster uploads
-                    config = TransferConfig(
-                        multipart_threshold=8 * 1024 * 1024,  # 8MB threshold
-                        max_concurrency=20,  # Maximum concurrent uploads
-                        multipart_chunksize=8 * 1024 * 1024,  # 8MB chunks for optimal speed
-                        use_threads=True
-                    )
-                    
-                    # Use direct boto3 upload with config
-                    client.upload_file(
-                        base_name,
-                        S3_BUCKET_NAME,
-                        s3_key,
-                        ExtraArgs={'ContentType': 'video/mp4'},
-                        Config=config
-                    )
-                    s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
-                    url = generate_s3_http_url(s3_key)
-                    
-                    download_url = client.generate_presigned_url(
-                        'get_object',
-                        Params={
-                            'Bucket': S3_BUCKET_NAME,
-                            'Key': s3_key,
-                            'ResponseContentDisposition': f'attachment; filename="{base_name}"',
-                            'ResponseContentType': "video/mp4"
-                        },
-                        ExpiresIn=3600
-                    )
-                    
-                    return jsonify({
-                        # Keep legacy fields if someone still calls /generate with retrieve
-                        "mode": "retrieve",
-                        "s3_uri": s3_uri,
-                        "url": url,
-                        "download_url": download_url,
-                        "filename": base_name
-                    })
-                else:
-                    return jsonify({"error": "Failed to process videos"}), 500
-            finally:
-                os.chdir(cwd)
-
-    # Timelapse mode
-    # Fixed frame rate: 30 frames per second
-    duration = None  # Will be calculated based on frame count
-    
-    keys = list_frame_keys(camera, from_date, to_date)
-    logging.info(f"Found {len(keys)} frames")
-    if len(keys) > 0:
-        logging.info(f"First frame: {keys[0]}")
-        logging.info(f"Last frame: {keys[-1]}")
-    
-    if not keys:
-        return jsonify({"error": "No frames found in range"}), 200
-
-    ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    # Clean datetime strings for filename
-    from_clean = from_date.replace('T', '_').replace(':', '')
-    to_clean = to_date.replace('T', '_').replace(':', '')
-    base_name = f"{camera}_timelapse_{from_clean}_to_{to_clean}_{ts}"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_out = os.path.join(tmpdir, base_name)
-        ok, actual_path, mime = build_timelapse_from_keys(keys, local_out, duration)
-        if not ok or not actual_path or not mime:
-            return jsonify({"error": "Failed to build timelapse (no encoder available)"}), 500
-        file_name = os.path.basename(actual_path)
-        s3_key = f"{OUTPUT_PREFIX}/{file_name}"
-        
-        # Optimized upload config for timelapse
-        config = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,
-            max_concurrency=20,
-            multipart_chunksize=8 * 1024 * 1024,
-            use_threads=True
-        )
-        
-        client.upload_file(
-            actual_path,
-            S3_BUCKET_NAME,
-            s3_key,
-            ExtraArgs={'ContentType': mime},
-            Config=config
-        )
-        s3_uri = f"s3://{S3_BUCKET_NAME}/{s3_key}"
-        url = generate_s3_http_url(s3_key)
-        
-        # Generate presigned URL suitable for inline playback (no attachment disposition)
-        play_url = client.generate_presigned_url(
-            'get_object',
-            Params={
-                'Bucket': S3_BUCKET_NAME,
-                'Key': s3_key,
-                'ResponseContentType': mime
-            },
-            ExpiresIn=3600
-        )
-
-        # Generate presigned URL with content-disposition for forced download
-        download_url = client.generate_presigned_url(
-            'get_object',
-            Params={
-                'Bucket': S3_BUCKET_NAME,
-                'Key': s3_key,
-                'ResponseContentDisposition': f'attachment; filename="{file_name}"',
-                'ResponseContentType': mime
-            },
-            ExpiresIn=3600
-        )
-        
-        return jsonify({
-            "s3_uri": s3_uri, 
-            "url": url,
-            "play_url": play_url,
-            "download_url": download_url,
-            "filename": file_name
-        })
-
-
-@app.route("/retrieve-history", methods=["POST"])
-def retrieve_history():
-    # Accept both old and new payloads; prefer new trim-by-URL when present
+@app.route("/retrieve", methods=["POST"])
+def retrieve():
+    """Retrieve and trim a video from a presigned URL"""
     try:
         payload = request.get_json(force=True)
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    new_url = payload.get("currnturl")
+    video_url = payload.get("currnturl")
     start_clip_txt = payload.get("StartDateTime")
     end_clip_txt = payload.get("EndDateTime")
 
-    if new_url and start_clip_txt and end_clip_txt:
-        # New behavior: trim single URL by relative MM:SS window
+    if not video_url or not start_clip_txt or not end_clip_txt:
+        return jsonify({"error": "Missing required fields: currnturl, StartDateTime, EndDateTime"}), 400
+
+    try:
         start_sec = _parse_clip_time_to_seconds(str(start_clip_txt))
         end_sec = _parse_clip_time_to_seconds(str(end_clip_txt))
-        if end_sec <= start_sec:
-            return jsonify({"error": "EndDateTime must be after StartDateTime"}), 400
+    except (ValueError, IndexError):
+        return jsonify({"error": "Invalid time format. Use MM:SS or HH:MM:SS"}), 400
 
-        # Derive a camera label from URL if possible
-        camera_match = re.search(r"/(camera\d+)/", new_url)
-        camera_label = camera_match.group(1) if camera_match else "cameraX"
-        ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-        base_name = f"{camera_label}_retrieved_{str(start_clip_txt).replace(':','-')}_to_{str(end_clip_txt).replace(':','-')}_{ts}.mp4"
+    if end_sec <= start_sec:
+        return jsonify({"error": "EndDateTime must be after StartDateTime"}), 400
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cwd = os.getcwd()
-            os.chdir(tmpdir)
-            try:
-                ok = trim_video_by_url(new_url, start_sec, end_sec, base_name)
-                if not ok:
-                    return jsonify({"error": "Failed to process video via URL trim"}), 500
+    # Derive camera name from URL if possible
+    camera_match = re.search(r"/(camera\d+)/", video_url)
+    camera_label = camera_match.group(1) if camera_match else "camera"
+    
+    ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+    base_name = f"{camera_label}_clip_{str(start_clip_txt).replace(':','-')}_to_{str(end_clip_txt).replace(':','-')}_{ts}.mp4"
 
-                s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
-                config = TransferConfig(
-                    multipart_threshold=8 * 1024 * 1024,
-                    max_concurrency=20,
-                    multipart_chunksize=8 * 1024 * 1024,
-                    use_threads=True
-                )
-                client.upload_file(
-                    base_name,
-                    S3_BUCKET_NAME,
-                    s3_key,
-                    ExtraArgs={'ContentType': 'video/mp4'},
-                    Config=config
-                )
-                presigned = client.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': S3_BUCKET_NAME,
-                        'Key': s3_key,
-                        'ResponseContentType': 'video/mp4'
-                    },
-                    ExpiresIn=3600
-                )
-                download_url = client.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': S3_BUCKET_NAME,
-                        'Key': s3_key,
-                        'ResponseContentDisposition': f'attachment; filename="{base_name}"',
-                        'ResponseContentType': 'video/mp4'
-                    },
-                    ExpiresIn=3600
-                )
-
-                selected_mmss = payload.get("SelectedDuration") or _format_seconds_mmss(end_sec - start_sec)
-                return jsonify({
-                    "StartDateTime": str(start_clip_txt),
-                    "EndDateTime": str(end_clip_txt),
-                    "SelectedDuration": selected_mmss,
-                    "currnturl": presigned,
-                    "download_url": download_url
-                })
-            finally:
-                os.chdir(cwd)
-    else:
-        # Fallback to old behavior using camera + date/time payload
-        camera_id = str(payload.get("camera", "")).strip()
-        start_str = payload.get("startTime")
-        end_str = payload.get("endTime")
-        mail = payload.get("mail")
-
-        if not camera_id or not start_str or not end_str:
-            return jsonify({"error": "Missing required fields: camera, startTime, endTime"}), 400
-
-        camera_name = f"camera{camera_id}"
-        if camera_name not in CAMERAS:
-            return jsonify({"error": "Invalid camera"}), 400
-
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cwd = os.getcwd()
+        os.chdir(tmpdir)
         try:
-            start_dt_ist = IST.localize(datetime.strptime(start_str, "%m/%d/%Y, %H:%M:%S"))
-            end_dt_ist = IST.localize(datetime.strptime(end_str, "%m/%d/%Y, %H:%M:%S"))
-        except ValueError:
-            return jsonify({"error": "Invalid datetime format. Use MM/DD/YYYY, HH:MM:SS"}), 400
+            ok = trim_video_by_url(video_url, start_sec, end_sec, base_name)
+            if not ok:
+                return jsonify({"error": "Failed to process video"}), 500
 
-        if end_dt_ist <= start_dt_ist:
-            return jsonify({"error": "endTime must be after startTime"}), 400
+            # Upload to S3
+            s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
+            logging.info(f"Uploading to S3: {s3_key}")
+            
+            config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024,
+                max_concurrency=20,
+                multipart_chunksize=8 * 1024 * 1024,
+                use_threads=True
+            )
+            
+            client.upload_file(
+                base_name,
+                S3_BUCKET_NAME,
+                s3_key,
+                ExtraArgs={'ContentType': 'video/mp4'},
+                Config=config
+            )
+            
+            # Generate presigned URLs
+            presigned = client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': S3_BUCKET_NAME,
+                    'Key': s3_key,
+                    'ResponseContentType': 'video/mp4'
+                },
+                ExpiresIn=3600
+            )
+            
+            download_url = client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': S3_BUCKET_NAME,
+                    'Key': s3_key,
+                    'ResponseContentDisposition': f'attachment; filename="{base_name}"',
+                    'ResponseContentType': 'video/mp4'
+                },
+                ExpiresIn=3600
+            )
 
-        videos = list_video_keys(camera_name, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"))
-        if not videos:
-            return jsonify({"error": "No videos found in range"}), 200
-
-        ts = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-        base_name = f"{camera_name}_retrieved_{start_dt_ist.strftime('%Y-%m-%d_%H%M')}_to_{end_dt_ist.strftime('%Y-%m-%d_%H%M')}_{ts}.mp4"
-
-        selected_duration_sec = int((end_dt_ist - start_dt_ist).total_seconds())
-        selected_duration_mmss = f"{selected_duration_sec // 60}:{str(selected_duration_sec % 60).zfill(2)}"
-        try:
-            total_duration_sec = int((videos[0]['end_ist'] - videos[0]['start_ist']).total_seconds())
-            total_duration_mmss = f"{total_duration_sec // 60}:{str(total_duration_sec % 60).zfill(2)}"
-        except Exception:
-            total_duration_mmss = "59:59"
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cwd = os.getcwd()
-            os.chdir(tmpdir)
-            try:
-                ok = process_videos(videos, start_dt_ist.strftime("%Y-%m-%dT%H:%M"), end_dt_ist.strftime("%Y-%m-%dT%H:%M"), base_name)
-                if not ok:
-                    return jsonify({"error": "Failed to process videos"}), 500
-
-                s3_key = f"{HISTORY_TRIMMER_PREFIX}/{base_name}"
-                config = TransferConfig(
-                    multipart_threshold=8 * 1024 * 1024,
-                    max_concurrency=20,
-                    multipart_chunksize=8 * 1024 * 1024,
-                    use_threads=True
-                )
-                client.upload_file(
-                    base_name,
-                    S3_BUCKET_NAME,
-                    s3_key,
-                    ExtraArgs={'ContentType': 'video/mp4'},
-                    Config=config
-                )
-                presigned = client.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': S3_BUCKET_NAME,
-                        'Key': s3_key,
-                        'ResponseContentType': 'video/mp4'
-                    },
-                    ExpiresIn=3600
-                )
-                download_url = client.generate_presigned_url(
-                    'get_object',
-                    Params={
-                        'Bucket': S3_BUCKET_NAME,
-                        'Key': s3_key,
-                        'ResponseContentDisposition': f'attachment; filename="{base_name}"',
-                        'ResponseContentType': 'video/mp4'
-                    },
-                    ExpiresIn=3600
-                )
-
-                return jsonify({
-                    "StartDateTime": start_dt_ist.strftime("%H:%M"),
-                    "EndDateTime": end_dt_ist.strftime("%H:%M"),
-                    "SelectedDuration": selected_duration_mmss,
-                    "Total duaration": total_duration_mmss,
-                    "currnturl": presigned,
-                    "download_url": download_url
-                })
-            finally:
-                os.chdir(cwd)
+            selected_mmss = payload.get("SelectedDuration") or _format_seconds_mmss(end_sec - start_sec)
+            
+            return jsonify({
+                "StartDateTime": str(start_clip_txt),
+                "EndDateTime": str(end_clip_txt),
+                "SelectedDuration": selected_mmss,
+                "currnturl": presigned,
+                "download_url": download_url,
+                "s3_key": s3_key
+            })
+            
+        except Exception as e:
+            logging.error(f"Error processing video: {e}")
+            return jsonify({"error": f"Processing error: {str(e)}"}), 500
+        finally:
+            os.chdir(cwd)
 
 
 if __name__ == "__main__":
